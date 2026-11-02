@@ -72,16 +72,33 @@ def cmd_backtest(a) -> int:
 
 def cmd_copies(a) -> int:
     from .api.copy_account import copy_positions, copy_relations, relation_summary
+    from .rules import AccountSnapshot
 
     c = _client()
+    if a.diff:
+        from .diagnostics import deviation, format_deviation
+
+        _write(format_deviation(deviation(c)), a.out)
+        return 0
     for r in copy_relations(c):
         s = relation_summary(r)
         print(f"{s['nickname']}（{s['leadPortfolioId']}）权益 {s['marginBalance']:.2f}U 净投入 {s['netCopyAmount']:.2f}U "
               f"浮盈亏 {s['unrealizedPnl']:+.2f}U 已实现 {s['realizedPnl']:+.2f}U 模式 {s['copyMode']}"
               f"{' 已暂停' if s['isPaused'] else ''}")
+        acct = AccountSnapshot.from_relation(r)
+        print("   总止损：" + (f"{acct.native_stop_u:.0f}U（权益跌到约 {acct.native_stop_trigger_equity:.2f}U 触发，{acct.disposal}）"
+                              if acct.has_native_stop else "未设置"))
         for p in copy_positions(c, str(r.get("copyPortfolioId")), str(r.get("leadPortfolioId"))):
+            liq = f"{p.liquidation_price:.6g}" if p.liquidation_valid() else "-"
             print(f"   {p.symbol} {p.side} {p.leverage:g}x 数量 {p.qty:g} 开仓 {p.entry_price:.6g} 现价 {p.mark_price:.6g}"
-                  f" ROI {p.roi * 100:+.1f}% 浮盈亏 {p.unrealized_pnl:+.2f}U 强平 {p.liquidation_price:.6g}")
+                  f" 保证金 {p.margin:.2f}U ROI {p.roi * 100:+.1f}% 浮盈亏 {p.unrealized_pnl:+.2f}U 强平 {liq}")
+    return 0
+
+
+def cmd_costs(a) -> int:
+    from .diagnostics import costs, format_costs
+
+    _write(format_costs(costs(_client())), a.out)
     return 0
 
 
@@ -157,7 +174,13 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(fn=fn)
 
     p = sub.add_parser("copies", help="我的跟单关系与仓位（需凭证）")
+    p.add_argument("--diff", action="store_true", help="跟单偏差报告：超配/低配/漏单/残留、实际杠杆对比")
+    p.add_argument("--out", help="报告写入文件（Markdown）")
     p.set_defaults(fn=cmd_copies)
+
+    p = sub.add_parser("costs", help="跟单损耗报告：手续费、分润、相对领航员的滑点（需凭证）")
+    p.add_argument("--out", help="报告写入文件（Markdown）")
+    p.set_defaults(fn=cmd_costs)
 
     p = sub.add_parser("monitor", help="实时监控与提醒")
     p.add_argument("-c", "--config", default="config.toml")

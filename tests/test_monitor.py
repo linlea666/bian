@@ -131,3 +131,45 @@ def test_startup_summary_instead_of_flood():
     assert "2 个持仓" in n.msgs[0][1] and "建议止损上移" in n.msgs[0][1]
     clock.t += 20
     assert rules(mon.poll_once()) == []  # 第二轮不再重复 R04
+
+
+class CredClient:
+    """模拟带凭证的客户端：detail-list 返回一个跟单关系。"""
+
+    has_credentials = True
+
+    def __init__(self, rel):
+        self.rel = rel
+
+    def get(self, path, params=None, private=False):
+        if path.endswith("/copy-portfolio/detail-list"):
+            return [self.rel]
+        return {"nickname": "X", "positionShow": False}
+
+
+def test_auto_discover_and_account_rule():
+    rel = {"leadPortfolioId": "L", "copyPortfolioId": "C", "nickname": "自动发现", "marginBalance": "300",
+           "netCopyAmount": "300", "totalStopLossUsdt": None, "totalStopLossAmount": "0", "isPaused": False}
+    cfg = AppConfig(db_path=":memory:")
+    n = FakeNotifier()
+    mon = Monitor(cfg, CredClient(rel), n, Store(":memory:"), Clock())
+    mon.setup()
+    assert [(lr.cfg.portfolio_id, lr.source, lr.copy_portfolio_id) for lr in mon.leaders] == [("L", "copy", "C")]
+    mon.fetch = lambda lr: []
+    out = mon.poll_once()
+    assert "A02" in rules(out) and "总止损" in n.msgs[-1][1]
+
+
+def leg(side, qty=1.0, pnl=0.0):
+    return Position("L", "ETHUSDT", side, qty, 100.0, 100.0, 10, pnl, "copy", initial_margin=10)
+
+
+def test_hedge_transition_is_not_open_or_close():
+    mon, clock = make([[leg("LONG")], [leg("LONG"), leg("SHORT")], [leg("LONG")]])
+    mon.leaders[0].initialized = True
+    assert rules(mon.poll_once()) == ["R00"]  # 新开多单
+    clock.t += 20
+    assert rules(mon.poll_once()) == []  # 变成对冲：不报新开仓/平仓
+    assert "L:ETHUSDT:HEDGE" in mon.states
+    clock.t += 20
+    assert rules(mon.poll_once()) == []

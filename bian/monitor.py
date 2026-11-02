@@ -7,9 +7,13 @@ from dataclasses import asdict, dataclass, field
 from .api import copy_account, leaders as leaders_api
 from .client import AuthExpired, BinanceError, Client, RateLimited
 from .config import AppConfig, LeaderConfig
+from .exposure import describe_legs, net_by_symbol
 from .models import Position
 from .notify import Notifier
-from .rules import Alert, PortfolioState, PosState, RuleConfig, evaluate, evaluate_portfolio
+from .rules import (
+    AccountSnapshot, AccountState, Alert, PortfolioState, PosState, RuleConfig,
+    evaluate, evaluate_account, evaluate_portfolio,
+)
 from .store import Store
 
 LEAD_URL = "https://www.binance.com/zh-CN/copy-trading/lead-details/{}"
@@ -27,7 +31,7 @@ class LeaderRuntime:
     last_ok: float = 0.0
     stale_alerted: bool = False
     empty_polls: int = 0
-    positions: dict[str, Position] = field(default_factory=dict)
+    positions: dict[str, Position] = field(default_factory=dict)  # 原始单腿仓位
     blocked_reason: str = ""
     initialized: bool = False  # 首次成功拉取前的已有持仓合并成一条汇总，避免启动刷屏
 
@@ -35,8 +39,12 @@ class LeaderRuntime:
 class Monitor:
     def __init__(self, cfg: AppConfig, client: Client, notifier: Notifier, store: Store, clock=time.time):
         self.cfg, self.client, self.notifier, self.store, self.clock = cfg, client, notifier, store, clock
+        saved = store.load_states()
         self.states: dict[str, PosState] = {
-            k: PosState.from_dict(v) for k, v in store.load_states().items()
+            k: PosState.from_dict(v) for k, v in saved.items() if not k.startswith("acct:")
+        }
+        self.accounts: dict[str, AccountState] = {
+            k: AccountState.from_dict(v) for k, v in saved.items() if k.startswith("acct:")
         }
         self.portfolio = PortfolioState()
         self.auth_alerted = False
@@ -52,6 +60,12 @@ class Monitor:
                 self._auth_alert()
             except BinanceError as e:
                 print(f"读取跟单关系失败：{e}")
+        if self.cfg.auto_discover:
+            known = {lr.cfg.portfolio_id for lr in self.leaders}
+            for pid, rel in relations.items():
+                if pid not in known:
+                    c = LeaderConfig(portfolio_id=pid, name=str(rel.get("nickname") or ""), source="copy")
+                    self.leaders.append(LeaderRuntime(c, self.cfg.rules))
         for lr in self.leaders:
             pid = lr.cfg.portfolio_id
             try:
@@ -100,8 +114,36 @@ class Monitor:
                 sent += self._check_stale(lr, now)
                 continue
             sent += self._process(lr, positions, now)
+        sent += self._accounts(now)
         sent += self._portfolio(now)
         return sent
+
+    def _accounts(self, now: float) -> list[Alert]:
+        """跟单账户级规则：权益回撤、原生总止损。每轮一次 detail-list 请求。"""
+        if not self.client.has_credentials or not any(lr.source == "copy" for lr in self.leaders):
+            return []
+        try:
+            rels = copy_account.copy_relations(self.client)
+        except AuthExpired:
+            self._auth_alert()
+            return []
+        except BinanceError as e:
+            print(f"读取跟单关系失败：{e}")
+            return []
+        by_id = {lr.cfg.portfolio_id: lr for lr in self.leaders}
+        out: list[Alert] = []
+        for r in rels:
+            snap = AccountSnapshot.from_relation(r)
+            lr = by_id.get(snap.lead_id)
+            if lr is None:
+                continue
+            key = f"acct:{snap.lead_id}"
+            st, alerts = evaluate_account(snap, self.accounts.get(key), lr.rules, now,
+                                          lr.cfg.recommended_total_stop_u)
+            self.accounts[key] = st
+            self.store.save_state(key, st.to_dict())
+            out += [self._send(a, lr) for a in alerts]
+        return out
 
     def _process(self, lr: LeaderRuntime, positions: list[Position], now: float) -> list[Alert]:
         out: list[Alert] = []
@@ -132,17 +174,25 @@ class Monitor:
         self.auth_alerted = False
         self.store.add_snapshot(lr.cfg.portfolio_id, lr.source, [asdict(p) for p in positions])
 
-        current = {p.key: p for p in positions}
-        lr.positions = current
+        lr.positions = {p.key: p for p in positions}
+        current = {p.key: p for p in net_by_symbol(positions)}  # 同币种多空合并后评估
+        prefix = lr.cfg.portfolio_id + ":"
+        prev_symbols = {k.split(":")[1] for k in self.states if k.startswith(prefix)}
+        cur_symbols = {p.symbol for p in current.values()}
         summary: list[str] = []
         for key, pos in current.items():
             known = key in self.states
-            st, alerts = evaluate(pos, self.states.get(key), lr.rules, now)
+            st, alerts = evaluate(pos, self.states.get(key), lr.rules, now, self._margin_u(lr, pos))
             self.states[key] = st
             self.store.save_state(key, st.to_dict())
+            if not known and pos.symbol in prev_symbols:
+                # 同币种从单边变成对冲（或反过来）：不当作新开仓
+                alerts = [a for a in alerts if a.rule_id != "R00"]
             if not lr.initialized and not known:
                 # 启动时已存在的仓位：info 级提醒并入汇总，warn/urgent 仍单独发
-                line = f"{pos.symbol} {'多' if pos.side == 'LONG' else '空'} {pos.leverage:g}x ROI {pos.roi * 100:+.1f}%"
+                line = f"{pos.symbol} {self._side_cn(pos)} {pos.leverage:g}x ROI {pos.roi * 100:+.1f}%"
+                if pos.source == "copy":
+                    line += f"（{pos.unrealized_pnl:+.2f}U）"
                 if any(a.rule_id == "R04" for a in alerts):
                     be = pos.break_even_price if pos.break_even_price > 0 else pos.entry_price
                     line += f"（浮盈已达保本门槛，建议止损上移到约 {be:.6g}）"
@@ -157,9 +207,11 @@ class Monitor:
                     "R00", "info", f"leader:{lr.cfg.portfolio_id}", 0,
                     f"开始监控，当前 {len(summary)} 个持仓（来源：{'我的跟单仓位' if lr.source == 'copy' else '领航员公开持仓'}）",
                     "\n".join(summary), ts=now), lr))
-        for key in [k for k in self.states if k.startswith(lr.cfg.portfolio_id + ":") and k not in current]:
+        for key in [k for k in self.states if k.startswith(prefix) and k not in current]:
             st = self.states.pop(key)
             self.store.delete_state(key)
+            if key.split(":")[1] in cur_symbols:
+                continue  # 只是多空结构变化，币种仍在持仓
             out.append(self._send(Alert(
                 "R11", "info", key, st.version, "仓位已平（或已不在列表中）",
                 f"最后 ROI {st.last_roi * 100:+.1f}%，期间最高 {st.peak_roi * 100:+.1f}%、最低 {st.trough_roi * 100:+.1f}%",
@@ -180,13 +232,24 @@ class Monitor:
             return []
         est = 0.0
         for lr in self.leaders:
-            for p in lr.positions.values():
+            for p in net_by_symbol(list(lr.positions.values())):
                 if p.source == "copy":
                     est += p.unrealized_pnl
                 elif lr.cfg.position_margin_u > 0:
                     est += p.roi * lr.cfg.position_margin_u
         self.portfolio, alert = evaluate_portfolio(est, self.cfg.loss_budget_u, self.portfolio, now)
         return [self._send(alert)] if alert else []
+
+    @staticmethod
+    def _margin_u(lr: LeaderRuntime, pos: Position) -> float | None:
+        """我在该仓位上的保证金（U），用于换算盈亏金额。"""
+        if pos.source == "copy":
+            return pos.margin or None
+        return lr.cfg.position_margin_u or None
+
+    @staticmethod
+    def _side_cn(pos: Position) -> str:
+        return {"LONG": "多", "SHORT": "空", "HEDGE": "多空对冲"}.get(pos.side, pos.side)
 
     def _auth_alert(self) -> None:
         if not self.auth_alerted:
@@ -202,9 +265,13 @@ class Monitor:
         head = a.title
         if lr and pos:
             src = "我的跟单仓位" if pos.source == "copy" else "领航员仓位"
-            head = f"[{lr.name}] {pos.symbol} {'多' if pos.side == 'LONG' else '空'} {pos.leverage:g}x ｜{a.title}"
+            head = f"[{lr.name}] {pos.symbol} {self._side_cn(pos)} {pos.leverage:g}x ｜{a.title}"
             lines.append(head)
-            lines.append(f"{src}：开仓 {pos.entry_price:.6g} 现价 {pos.mark_price:.6g} ROI {pos.roi * 100:+.1f}%")
+            if pos.is_hedge:
+                lines.append(f"{src}（多空合并）：现价 {pos.mark_price:.6g} 合计 ROI {pos.roi * 100:+.1f}%")
+                lines.append("两条腿：" + describe_legs(list(lr.positions.values()), pos.symbol))
+            else:
+                lines.append(f"{src}：开仓 {pos.entry_price:.6g} 现价 {pos.mark_price:.6g} ROI {pos.roi * 100:+.1f}%")
             if pos.source == "copy":
                 lines.append(f"浮动盈亏 {pos.unrealized_pnl:+.2f}U")
             elif lr.cfg.position_margin_u > 0:

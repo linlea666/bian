@@ -6,6 +6,7 @@
 poll_seconds = 20        # 轮询间隔（秒），不小于 5
 stale_seconds = 120      # 超过该时间没拿到新数据 → 数据失联提醒
 empty_confirm_polls = 2  # 持仓列表突然变空需连续确认几次才判定为平仓
+auto_discover = true     # 有凭证时自动监控我所有的跟单关系（不用在下面逐个写领航员）
 db_path = "bian.db"
 
 [portfolio]
@@ -22,6 +23,12 @@ trail_trigger_roi = 0.20     # R05 浮盈回撤保护启动门槛
 trail_gap_roi = 0.15         # R05 从最高浮盈回撤多少个 ROI 点提醒
 liq_distance_pct = 0.05      # R09 标记价距离强平价 ≤5% 紧急提醒（仅“我的跟单仓位”有强平价）
 urgent_repeat_minutes = 30
+min_alert_u = 2.0            # 我的盈亏金额低于 2U 的 ROI 类提醒不发（小仓位防刷屏）
+# 跟单账户级（每个跟单关系，需凭证）
+account_dd_warn = 0.10       # A01 跟单权益从最高点回撤 10%
+account_dd_severe = 0.20     # A01b 回撤 20%（紧急）
+recommend_total_stop_pct = 0.20  # A02 未设原生总止损时，建议止损额 = 净投入 × 20%
+native_stop_near_pct = 0.30  # A03 距原生总止损触发只剩止损额的 30%
 
 [notify]
 stdout = true
@@ -35,6 +42,7 @@ name = "示例领航员"
 # copy：只读我的跟单仓位（需凭证）；public：只读领航员公开持仓（需领航员开启展示持仓）
 source = "auto"
 position_margin_u = 20   # public 模式下估算我的 U 盈亏：我每笔大约投入多少 U 保证金
+# recommended_total_stop_u = 50  # 可选：该领航员建议的跟单总止损额（覆盖按比例的默认建议）
 
   # 可选：该领航员单独的阈值（覆盖全局）
   [leaders.rules]

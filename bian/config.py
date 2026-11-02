@@ -13,6 +13,7 @@ class LeaderConfig:
     name: str = ""
     source: str = "auto"  # auto / copy（我的跟单仓位，需凭证）/ public（领航员公开持仓）
     position_margin_u: float = 0.0  # public 模式下，我每笔跟单大约投入多少 U 保证金（用于估算 U 亏损）
+    recommended_total_stop_u: float = 0.0  # 建议的跟单总止损额（U）；0 = 按 净投入 × recommend_total_stop_pct
     rules: dict = field(default_factory=dict)
 
 
@@ -21,6 +22,7 @@ class AppConfig:
     poll_seconds: float = 20
     stale_seconds: float = 120
     empty_confirm_polls: int = 2
+    auto_discover: bool = True  # 有凭证时自动监控我所有的跟单关系
     db_path: str = "bian.db"
     loss_budget_u: float = 0.0
     rules: RuleConfig = field(default_factory=RuleConfig)
@@ -38,6 +40,7 @@ def load_config(path: str) -> AppConfig:
         poll_seconds=float(mon.get("poll_seconds", 20)),
         stale_seconds=float(mon.get("stale_seconds", 120)),
         empty_confirm_polls=int(mon.get("empty_confirm_polls", 2)),
+        auto_discover=bool(mon.get("auto_discover", True)),
         db_path=str(mon.get("db_path", "bian.db")),
         loss_budget_u=float(raw.get("portfolio", {}).get("loss_budget_u", 0)),
         rules=RuleConfig().merged(raw.get("rules")),
@@ -50,6 +53,7 @@ def load_config(path: str) -> AppConfig:
             name=str(item.get("name", "")),
             source=str(item.get("source", "auto")),
             position_margin_u=float(item.get("position_margin_u", 0)),
+            recommended_total_stop_u=float(item.get("recommended_total_stop_u", 0)),
             rules=dict(item.get("rules", {})),
         ))
     if cfg.poll_seconds < 5:
