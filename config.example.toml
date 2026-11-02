@@ -1,0 +1,41 @@
+# 复制为 config.toml 后修改。凭证不要写在这里，用环境变量：
+#   BINANCE_P20T / BINANCE_CSRFTOKEN      —— 读取“我的跟单仓位”和未公开持仓的领航员（可选）
+#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID —— 手机推送（可选）
+
+[monitor]
+poll_seconds = 20        # 轮询间隔（秒），不小于 5
+stale_seconds = 120      # 超过该时间没拿到新数据 → 数据失联提醒
+empty_confirm_polls = 2  # 持仓列表突然变空需连续确认几次才判定为平仓
+db_path = "bian.db"
+
+[portfolio]
+loss_budget_u = 100      # 组合预估浮亏超过该金额(U) → 紧急提醒；0 = 关闭
+
+# 全局规则阈值（ROI 小数：-0.2 = -20%）。先用 `bian backtest <领航员ID>` 看哪组参数适合该领航员。
+[rules]
+warn_roi = -0.20             # R01 单仓风险提醒
+severe_roi = -0.35           # R02 单仓严重亏损
+hard_stop_roi = -0.40        # R03 计划硬止损线（持续时每 urgent_repeat_minutes 重复提醒）
+breakeven_trigger_roi = 0.20 # R04 浮盈达到后建议把止损上移到保本
+breakeven_lock_roi = 0.02    #     保本止损锁定的 ROI（覆盖手续费）
+trail_trigger_roi = 0.20     # R05 浮盈回撤保护启动门槛
+trail_gap_roi = 0.15         # R05 从最高浮盈回撤多少个 ROI 点提醒
+liq_distance_pct = 0.05      # R09 标记价距离强平价 ≤5% 紧急提醒（仅“我的跟单仓位”有强平价）
+urgent_repeat_minutes = 30
+
+[notify]
+stdout = true
+telegram = true
+
+# 每个跟随的领航员一段。portfolio_id = 领航员主页 URL 里 lead-details/ 后面的数字
+[[leaders]]
+portfolio_id = "4708220152086930177"
+name = "示例领航员"
+# auto：有凭证且已跟单 → 读我的跟单仓位；否则读领航员公开持仓
+# copy：只读我的跟单仓位（需凭证）；public：只读领航员公开持仓（需领航员开启展示持仓）
+source = "auto"
+position_margin_u = 20   # public 模式下估算我的 U 盈亏：我每笔大约投入多少 U 保证金
+
+  # 可选：该领航员单独的阈值（覆盖全局）
+  [leaders.rules]
+  hard_stop_roi = -0.30

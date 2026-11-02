@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bian"
+version = "0.1.0"
+description = "币安合约跟单风控助手：领航员画像、止损规则回测、持仓监控与提醒（只读，不下单）"
+requires-python = ">=3.11"
+dependencies = []  # 运行时仅用标准库
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+bian = "bian.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bian*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
