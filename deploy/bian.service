@@ -1,0 +1,30 @@
+[Unit]
+Description=bian 币安跟单风控助手（只读监控与提醒，不下单）
+Documentation=https://github.com/linlea666/bian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bian
+Group=bian
+WorkingDirectory=/opt/bian/data
+Environment=PYTHONPATH=/opt/bian
+Environment=BIAN_ENV_FILE=/opt/bian/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m bian.cli monitor -c /opt/bian/data/config.toml
+Restart=always
+RestartSec=15
+
+# 与同机的其他项目（例如 joz / NOFX）隔离，资源占用压低
+MemoryMax=256M
+CPUWeight=50
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bian/data
+
+[Install]
+WantedBy=multi-user.target

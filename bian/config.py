@@ -29,6 +29,9 @@ class AppConfig:
     leaders: list[LeaderConfig] = field(default_factory=list)
     stdout: bool = True
     telegram: bool = True
+    email: bool = True
+    email_min_severity: str = "warn"  # info / warn / urgent：低于该级别的提醒不发邮件
+    email_max_per_hour: int = 12
 
 
 def load_config(path: str) -> AppConfig:
@@ -46,6 +49,9 @@ def load_config(path: str) -> AppConfig:
         rules=RuleConfig().merged(raw.get("rules")),
         stdout=bool(notify.get("stdout", True)),
         telegram=bool(notify.get("telegram", True)),
+        email=bool(notify.get("email", True)),
+        email_min_severity=str(notify.get("email_min_severity", "warn")),
+        email_max_per_hour=int(notify.get("email_max_per_hour", 12)),
     )
     for item in raw.get("leaders", []):
         cfg.leaders.append(LeaderConfig(
@@ -56,6 +62,8 @@ def load_config(path: str) -> AppConfig:
             recommended_total_stop_u=float(item.get("recommended_total_stop_u", 0)),
             rules=dict(item.get("rules", {})),
         ))
+    if cfg.email_min_severity not in ("info", "warn", "urgent"):
+        raise ValueError("email_min_severity 只能是 info / warn / urgent")
     if cfg.poll_seconds < 5:
         raise ValueError("poll_seconds 不能小于 5 秒（避免被限流）")
     return cfg

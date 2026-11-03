@@ -102,25 +102,37 @@ def cmd_costs(a) -> int:
     return 0
 
 
+def build_notifier(cfg, stdout_only: bool = False):
+    from .notify import EmailNotifier, MultiNotifier, SmtpConfig, StdoutNotifier, TelegramNotifier
+
+    notifiers = []
+    if cfg.stdout or stdout_only:
+        notifiers.append(StdoutNotifier())
+    if not stdout_only:
+        if cfg.email:
+            smtp = SmtpConfig.from_env()
+            if smtp:
+                notifiers.append(EmailNotifier(smtp, cfg.email_min_severity, cfg.email_max_per_hour))
+                print(f"邮件通知：{smtp.describe()}（级别 ≥ {cfg.email_min_severity}，每小时最多 {cfg.email_max_per_hour} 封）")
+            else:
+                print("未设置 SMTP_HOST / SMTP_USER / SMTP_PASS，不发邮件")
+        if cfg.telegram:
+            tg = TelegramNotifier.from_env()
+            if tg:
+                notifiers.append(tg)
+    if not notifiers:
+        notifiers.append(StdoutNotifier())
+    return MultiNotifier(notifiers)
+
+
 def cmd_monitor(a) -> int:
     from .config import load_config
     from .monitor import Monitor
-    from .notify import MultiNotifier, StdoutNotifier, TelegramNotifier
     from .store import Store
 
     cfg = load_config(a.config)
-    notifiers = []
-    if cfg.stdout or a.notify == "stdout":
-        notifiers.append(StdoutNotifier())
-    if cfg.telegram and a.notify != "stdout":
-        tg = TelegramNotifier.from_env()
-        if tg:
-            notifiers.append(tg)
-        else:
-            print("未设置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，仅输出到控制台")
-    if not notifiers:
-        notifiers.append(StdoutNotifier())
-    mon = Monitor(cfg, _client(), MultiNotifier(notifiers), Store(cfg.db_path))
+    notifier = build_notifier(cfg, a.notify == "stdout")
+    mon = Monitor(cfg, _client(), notifier, Store(cfg.db_path))
     if a.once:
         mon.setup()
         mon.poll_once()
@@ -132,6 +144,14 @@ def cmd_monitor(a) -> int:
     return 0
 
 
+def cmd_doctor(a) -> int:
+    from .doctor import run_doctor
+
+    lines, fails = run_doctor(_client(), a.config, a.test_email)
+    print("\n".join(lines))
+    return 1 if fails else 0
+
+
 def cmd_alerts(a) -> int:
     import time
 
@@ -139,8 +159,12 @@ def cmd_alerts(a) -> int:
     from .store import Store
 
     for ts, sev, rule, key, title, ok, err in Store(load_config(a.config).db_path).recent_alerts(a.limit):
-        print(f"{time.strftime('%m-%d %H:%M:%S', time.localtime(ts))} {sev:<6} {rule:<4} {key} {title}"
-              f"{'' if ok else ' [未送达: ' + (err or '') + ']'}")
+        note = ""
+        if not ok:
+            note = f"  [未送达：{err}]"
+        elif err and "低于邮件通知级别" not in err:
+            note = f"  [部分渠道：{err}]"
+        print(f"{time.strftime('%m-%d %H:%M:%S', time.localtime(ts))} {sev:<6} {rule:<4} {key} {title}{note}")
     return 0
 
 
@@ -188,12 +212,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--once", action="store_true", help="只轮询一次（测试用）")
     p.set_defaults(fn=cmd_monitor)
 
+    p = sub.add_parser("doctor", help="部署自检：网络、凭证、邮件、配置")
+    p.add_argument("-c", "--config", default="config.toml")
+    p.add_argument("--test-email", action="store_true", help="发送一封测试邮件")
+    p.set_defaults(fn=cmd_doctor)
+
     p = sub.add_parser("alerts", help="查看最近提醒记录")
     p.add_argument("-c", "--config", default="config.toml")
     p.add_argument("--limit", type=int, default=30)
     p.set_defaults(fn=cmd_alerts)
 
     a = ap.parse_args(argv)
+    from .envfile import load_env_file
+
+    load_env_file()
     try:
         return a.fn(a)
     except AuthExpired as e:

@@ -1,6 +1,6 @@
-# 复制为 config.toml 后修改。凭证不要写在这里，用环境变量：
-#   BINANCE_P20T / BINANCE_CSRFTOKEN      —— 读取“我的跟单仓位”和未公开持仓的领航员（可选）
-#   TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID —— 手机推送（可选）
+# 复制为 config.toml 后修改。凭证不要写在这里，放在 .env（见 deploy/env.example）：
+#   BINANCE_P20T / BINANCE_CSRFTOKEN —— 读取“我的跟单仓位”、总止损设置、未公开持仓的领航员
+#   SMTP_*                           —— 邮件提醒
 
 [monitor]
 poll_seconds = 20        # 轮询间隔（秒），不小于 5
@@ -14,9 +14,15 @@ loss_budget_u = 100      # 组合预估浮亏超过该金额(U) → 紧急提醒
 
 # 全局规则阈值（ROI 小数：-0.2 = -20%）。先用 `bian backtest <领航员ID>` 看哪组参数适合该领航员。
 [rules]
-warn_roi = -0.20             # R01 单仓风险提醒
-severe_roi = -0.35           # R02 单仓严重亏损
-hard_stop_roi = -0.40        # R03 计划硬止损线（持续时每 urgent_repeat_minutes 重复提醒）
+# ---- 仓位亏损分档通知（L1/L2/L3）：每档每个仓位只通知一次，跌到更高档立即再通知
+loss_tiers = [50, 100, 150]  # 亏损百分比档位；第 1 档“提醒”，之后“紧急”
+loss_tiers_mode = "roi"      # roi：按仓位 ROI（= 浮亏 / 仓位保证金，与币安仓位页一致，全仓可超过 100%）
+                             # price：按价格反向波动 %，自动 × 杠杆。例如 [3, 5, 8] 在 10x 时 = ROI -30/-50/-80%，
+                             #        在 50x 时 = -150/-250/-400%，不同杠杆的风险尺度一致
+loss_rearm_gap = 10          # 亏损回升到“档位 − min(10, 档位/2)”以上才重新启用该档（防止阈值附近来回轰炸）
+loss_cooldown_minutes = 15   # 同一仓位两条亏损通知至少间隔 15 分钟（跌到更高档除外）
+loss_max_per_day = 4         # 每个仓位每天最多 4 条亏损通知
+loss_top_tier_repeat_hours = 0  # 停在最高档超过 N 小时再提醒一次；0 = 不重复
 breakeven_trigger_roi = 0.20 # R04 浮盈达到后建议把止损上移到保本
 breakeven_lock_roi = 0.02    #     保本止损锁定的 ROI（覆盖手续费）
 trail_trigger_roi = 0.20     # R05 浮盈回撤保护启动门槛
@@ -31,19 +37,26 @@ recommend_total_stop_pct = 0.20  # A02 未设原生总止损时，建议止损�
 native_stop_near_pct = 0.30  # A03 距原生总止损触发只剩止损额的 30%
 
 [notify]
-stdout = true
-telegram = true
+stdout = true                # 输出到控制台 / journalctl
+email = true                 # 需要环境变量 SMTP_HOST / SMTP_USER / SMTP_PASS（见 deploy/env.example）
+email_min_severity = "warn"  # info / warn / urgent：低于该级别只记日志、不发邮件（开仓、每日“未设总止损”是 info）
+email_max_per_hour = 12      # 同一轮的提醒合并成一封；每小时最多 12 封，超出的稍后合并补发
+telegram = false             # 可选：TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 
-# 每个跟随的领航员一段。portfolio_id = 领航员主页 URL 里 lead-details/ 后面的数字
-[[leaders]]
-portfolio_id = "4708220152086930177"
-name = "示例领航员"
-# auto：有凭证且已跟单 → 读我的跟单仓位；否则读领航员公开持仓
-# copy：只读我的跟单仓位（需凭证）；public：只读领航员公开持仓（需领航员开启展示持仓）
-source = "auto"
-position_margin_u = 20   # public 模式下估算我的 U 盈亏：我每笔大约投入多少 U 保证金
-# recommended_total_stop_u = 50  # 可选：该领航员建议的跟单总止损额（覆盖按比例的默认建议）
-
-  # 可选：该领航员单独的阈值（覆盖全局）
-  [leaders.rules]
-  hard_stop_roi = -0.30
+# ---- 领航员（可选）
+# 设置了凭证且 auto_discover = true 时，你所有的跟单关系会被自动监控，下面可以什么都不写。
+# 只有以下情况才需要添加：
+#   1. 给某位领航员单独设置阈值或建议总止损额；
+#   2. 没有凭证，想监控“公开持仓”的领航员。
+# portfolio_id = 领航员主页 URL 里 lead-details/ 后面的数字。去掉行首的 # 即可启用。
+#
+# [[leaders]]
+# portfolio_id = "1234567890123456789"
+# name = "某领航员"
+# source = "auto"              # auto：有凭证且已跟单 → 读我的跟单仓位；否则读领航员公开持仓
+#                              # copy：只读我的跟单仓位（需凭证）；public：只读公开持仓
+# position_margin_u = 20       # public 模式下估算我的 U 盈亏：我每笔大约投入多少 U 保证金
+# recommended_total_stop_u = 50  # 建议的跟单总止损额（覆盖“净投入 × 20%”的默认建议）
+#
+#   [leaders.rules]            # 该领航员单独的阈值（覆盖全局 [rules]）
+#   loss_tiers = [30, 60, 100]

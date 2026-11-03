@@ -64,17 +64,17 @@ def test_hedge_net_loss_alerts_without_price_suggestion():
     legs = [leg("LONG", 1, 100, 90, 10, symbol="X"), leg("SHORT", 0.2, 100, 90, 2, symbol="X")]
     h = net_by_symbol(legs)[0]  # (-10 + 2) / 12 = -66%
     _, alerts = evaluate(h, None, CFG, 0)
-    r03 = [a for a in alerts if a.rule_id == "R03"][0]
-    assert "对冲" in r03.suggestion and "R04" not in [a.rule_id for a in alerts]
+    tier = [a for a in alerts if a.rule_id.startswith("L")][0]
+    assert tier.rule_id == "L1" and "对冲" in tier.suggestion and "R04" not in [a.rule_id for a in alerts]
 
 
 def test_min_alert_u_gates_small_positions():
-    p = leg("LONG", 0.069, 287.16, 278.42, 1.92)  # -31%，约 -0.6U
+    p = leg("LONG", 0.069, 284, 270, 1.92)  # 约 -50%，约 -0.97U
     _, alerts = evaluate(p, None, CFG, 0, margin_u=p.margin)
     assert [a.rule_id for a in alerts] == ["R00"]
-    big = leg("LONG", 1, 100, 96.9, 10)  # -31%，-3.1U
+    big = leg("LONG", 1, 100, 94, 10)  # -60%，-6U
     _, alerts = evaluate(big, None, CFG, 0, margin_u=big.margin)
-    assert "R01" in [a.rule_id for a in alerts] and "U" in alerts[-1].title
+    assert "L1" in [a.rule_id for a in alerts] and "-6.00U" in alerts[-1].title
 
 
 def acct(equity, invested=300.0, stop_u=0.0, trigger=0.0, paused=False):

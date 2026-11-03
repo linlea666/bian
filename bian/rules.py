@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import time as _time
 from dataclasses import asdict, dataclass, field, fields, replace
 
 from .models import Position
@@ -14,9 +15,13 @@ SEVERITY_ORDER = {"info": 0, "warn": 1, "urgent": 2}
 
 @dataclass(frozen=True)
 class RuleConfig:
-    warn_roi: float = -0.20  # R01 单仓风险提醒
-    severe_roi: float = -0.35  # R02 单仓严重亏损
-    hard_stop_roi: float = -0.40  # R03 计划硬止损线（建议立即手动平仓）
+    # ---- 仓位亏损分档通知（L1/L2/L3...）
+    loss_tiers: tuple = (50.0, 100.0, 150.0)  # 亏损百分比档位；第 1 档“警告”，之后“紧急”
+    loss_tiers_mode: str = "roi"  # roi：按仓位 ROI（与币安仓位页一致）；price：按价格反向波动 %，自动 × 杠杆
+    loss_rearm_gap: float = 10.0  # 回升到“档位 − min(该值, 档位/2)”以上才重新武装该档（百分点）
+    loss_cooldown_minutes: float = 15  # 同一仓位两条亏损通知的最小间隔（升级到更高档除外）
+    loss_max_per_day: float = 4  # 每个仓位每天最多几条亏损通知
+    loss_top_tier_repeat_hours: float = 0  # 停在最高档超过 N 小时再提醒一次；0 = 关闭
     breakeven_trigger_roi: float = 0.20  # R04 浮盈达到后建议保本
     breakeven_lock_roi: float = 0.02  # 保本线锁定 ROI（覆盖手续费）
     trail_trigger_roi: float = 0.20  # R05 浮盈回撤保护启动门槛
@@ -36,8 +41,28 @@ class RuleConfig:
     def merged(self, overrides: dict | None) -> "RuleConfig":
         if not overrides:
             return self
-        names = {f.name for f in fields(self)}
-        return replace(self, **{k: float(v) for k, v in overrides.items() if k in names})
+        out = {}
+        for f in fields(self):
+            if f.name not in overrides:
+                continue
+            v = overrides[f.name]
+            if f.name == "loss_tiers":
+                tiers = tuple(sorted(float(x) for x in v if float(x) > 0))
+                if not tiers:
+                    raise ValueError("loss_tiers 至少需要一个正数档位")
+                out[f.name] = tiers
+            elif f.name == "loss_tiers_mode":
+                if v not in ("roi", "price"):
+                    raise ValueError("loss_tiers_mode 只能是 roi 或 price")
+                out[f.name] = v
+            else:
+                out[f.name] = float(v)
+        return replace(self, **out)
+
+    def tier_rois(self, leverage: float) -> list[float]:
+        """把档位换算成 ROI 亏损（正小数，0.5 = -50%）。"""
+        mult = max(leverage, 1.0) if self.loss_tiers_mode == "price" else 1.0
+        return [t / 100 * mult for t in self.loss_tiers]
 
 
 @dataclass
@@ -63,6 +88,8 @@ class PosState:
     last_roi: float = 0.0
     stage: str = "UNPROTECTED"
     fired: dict = field(default_factory=dict)  # rule_id -> {"version": v, "ts": t, "armed": bool, "ref": x}
+    # 亏损分档状态：不随加仓版本重置（避免领航员边亏边加时反复通知）
+    loss: dict = field(default_factory=lambda: {"fired": [], "last_ts": 0.0, "day": "", "day_count": 0, "top_ts": 0.0})
     first_seen: float = 0.0
     last_seen: float = 0.0
 
@@ -147,33 +174,7 @@ def evaluate(
     st.trough_roi = min(st.trough_roi, roi)
     repeat_s = cfg.urgent_repeat_minutes * 60
 
-    # ---- 亏损分级：同一次评估只发最高一级，低级别同时标记为已发（避免升级时重复轰炸）
-    stop_px = _px(pos.price_at_roi(cfg.hard_stop_roi))
-    if pos.is_hedge:
-        sugs = ("多空对冲仓合计亏损已超过计划止损线，建议检查两条腿并减掉亏损的一边或整体平仓",
-                "多空对冲仓合计严重亏损，检查两条腿是否都还需要保留",
-                "多空对冲仓合计浮亏，关注净敞口")
-    else:
-        sugs = (f"已越过计划止损价 {stop_px}，建议立即在币安手动平仓或减仓",
-                f"确认币安上是否已设止损；计划硬止损价约 {stop_px}",
-                f"关注该仓；计划硬止损价约 {stop_px}")
-    levels = [
-        ("R03", cfg.hard_stop_roi, "urgent", "触及计划硬止损线", sugs[0], repeat_s),
-        ("R02", cfg.severe_roi, "urgent", "单仓严重亏损", sugs[1], None),
-        ("R01", cfg.warn_roi, "warn", "单仓风险提醒", sugs[2], None),
-    ]
-    emitted = False
-    for rule, thr, sev, title, sug, rep in levels:
-        if roi <= thr:
-            if not big(roi):
-                continue  # 金额太小：不发也不标记，金额变大后再评估
-            if _can_fire(st, rule, now, rep):
-                if not emitted:
-                    add(rule, sev, f"{title}（ROI {_fmt_pct(roi)}{u(roi)}，阈值 {_fmt_pct(thr)}）", "", sug)
-                    emitted = True
-                _mark(st, rule, now)
-        elif roi > thr + cfg.rearm_gap:
-            _rearm(st, rule)
+    alerts += _loss_tiers(pos, st, cfg, now, margin_u)
 
     # ---- R09 接近强平
     if pos.liquidation_valid(cfg.liq_sanity_pct):
@@ -374,3 +375,79 @@ def evaluate_account(
 
     st.fired = shim.fired
     return st, alerts
+
+
+# ============================================================== 仓位亏损分档
+def _day(now: float) -> str:
+    return _time.strftime("%Y-%m-%d", _time.localtime(now))
+
+
+def _loss_tiers(pos: Position, st: PosState, cfg: RuleConfig, now: float, margin_u: float | None) -> list[Alert]:
+    """仓位亏损分档通知（参考 nofx-1 position_loss_alert，增加分档、冷却、每日上限）。
+
+    - 每档对每个仓位只通知一次；越过更高档立即再通知（升级不受冷却限制）。
+    - 回升到“档位 − min(rearm_gap, 档位/2)”以上，才重新武装该档。
+    - 同一仓位两条通知至少间隔 loss_cooldown_minutes（升级除外）；每天最多 loss_max_per_day 条。
+    - 被冷却/上限挡住的不标记，条件仍满足时稍后再发。
+    """
+    ls = st.loss
+    ls.setdefault("fired", [])
+    rois = cfg.tier_rois(pos.leverage)
+    loss = -pos.roi  # 正数 = 亏损
+    # 重新武装：亏损明显回升的档位
+    for i in list(ls["fired"]):
+        if i >= len(rois):
+            ls["fired"].remove(i)
+            continue
+        tier_pct = rois[i] * 100
+        if loss * 100 < tier_pct - min(cfg.loss_rearm_gap, tier_pct / 2):
+            ls["fired"].remove(i)
+    reached = max((i for i, r in enumerate(rois) if loss >= r), default=-1)
+    if reached < 0:
+        return []
+    if margin_u and loss * margin_u < cfg.min_alert_u:
+        return []  # 金额太小，不发也不标记
+
+    if ls.get("day") != _day(now):
+        ls["day"], ls["day_count"] = _day(now), 0
+    top_fired = max(ls["fired"], default=-1)
+    escalation = top_fired >= 0 and reached > top_fired
+    fresh = top_fired < 0
+    repeat = (reached == len(rois) - 1 and reached <= top_fired and cfg.loss_top_tier_repeat_hours > 0
+              and now - ls.get("top_ts", 0) >= cfg.loss_top_tier_repeat_hours * 3600)
+    if not (escalation or fresh or repeat):
+        return []
+    last = ls.get("last_ts") or None  # 从未通知过：不受冷却限制
+    if not escalation and last is not None and now - last < cfg.loss_cooldown_minutes * 60:
+        return []
+    if ls.get("day_count", 0) >= cfg.loss_max_per_day:
+        return []
+
+    for i in range(reached + 1):
+        if i not in ls["fired"]:
+            ls["fired"].append(i)
+    ls["fired"].sort()
+    ls["last_ts"] = now
+    ls["day_count"] = ls.get("day_count", 0) + 1
+    if reached == len(rois) - 1:
+        ls["top_ts"] = now
+
+    n = len(rois)
+    tier_roi = rois[reached]
+    mode = f"（价格反向 {cfg.loss_tiers[reached]:g}% × {max(pos.leverage, 1):g}x）" if cfg.loss_tiers_mode == "price" else ""
+    u = f" ≈ {-loss * margin_u:+.2f}U" if margin_u else ""
+    title = (f"仓位亏损达到第 {reached + 1}/{n} 档 -{tier_roi * 100:.0f}%{mode}："
+             f"当前 ROI {pos.roi * 100:+.1f}%{u}")
+    if repeat and not escalation and not fresh:
+        title = "仍处于最高亏损档：" + title
+    if pos.is_hedge:
+        suggestion = "多空对冲仓合计亏损：检查两条腿，减掉亏损的一边或整体平仓"
+    elif reached < n - 1:
+        nxt = rois[reached + 1]
+        suggestion = (f"请在币安该跟单仓位设置止损或手动减仓；下一档 -{nxt * 100:.0f}% 对应价格约 "
+                      f"{_px(pos.price_at_roi(-nxt))}，可把止损设在此价之前")
+    else:
+        suggestion = "已达最高档：建议立即在币安手动平仓或减仓"
+    sev = "warn" if reached == 0 else "urgent"
+    return [Alert(f"L{reached + 1}", sev, pos.key, st.version, title,
+                  f"开仓 {_px(pos.entry_price)}，现价 {_px(pos.mark_price)}", suggestion, now)]

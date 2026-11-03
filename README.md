@@ -9,18 +9,19 @@
 | `bian leaders` | 领航员榜单（ROI、回撤、胜率、跟单者盈亏） | 否 |
 | `bian profile <ID>` | 领航员画像：胜率、盈亏比、扛单率、利润回吐、最大浮亏等 | 否 |
 | `bian backtest <ID>` | 画像 + 止损/保本/回撤止盈规则回测（含样本外验证），告诉你该领航员适不适合加止损、加多少 | 否 |
-| `bian monitor` | 实时监控持仓，按规则提醒（控制台 / Telegram） | 公开持仓的领航员不需要；隐藏持仓的需要 |
+| `bian monitor` | 实时监控持仓，按规则提醒（控制台 / 邮件 / Telegram） | 公开持仓的领航员不需要；隐藏持仓的需要 |
 | `bian copies` | 我的跟单关系、权益、原生总止损设置和仓位 | 需要 |
 | `bian copies --diff` | 跟单偏差：哪些仓位超配、低配、漏单、残留，以及我和领航员的实际杠杆对比（回答“为什么盈利时没跟上”） | 需要 |
 | `bian costs` | 跟单损耗：手续费、分润、开平仓价相对领航员的滑点 | 需要 |
 | `bian probe` | 检测各接口是否可用 | 私有部分需要 |
 | `bian alerts` | 查看提醒记录（含发送失败的） | 否 |
+| `bian doctor` | 部署自检：网络、凭证、邮件、配置；`--test-email` 发测试邮件 | 否 |
 
 `<ID>` 是领航员主页 URL 中 `lead-details/` 后面的数字。
 
 ## 安装
 
-运行时只用 Python 3.11+ 标准库，无第三方依赖。
+运行时只用 Python 3.11+ 标准库，无第三方依赖。部署到服务器请直接看下面的“部署到服务器”。本地开发：
 
 ```bash
 git clone https://github.com/linlea666/bian && cd bian
@@ -39,15 +40,18 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 2. **设置跟单总止损**：这是币安原生功能，由交易所自动执行，是目前唯一能真正“自动少亏”的手段。`bian monitor` 会提醒哪些跟单还没设置，并给出建议金额。
 3. **检查跟单偏差**：`bian copies --diff`。跟单金额太小会被最小下单量取整，导致超配或漏单。
 4. **配置监控**：`cp config.example.toml config.toml`。有凭证时会自动监控你所有的跟单关系；没有凭证时，填入领航员 ID（可以按领航员单独覆盖阈值）。
-5. **运行**：`bian monitor -c config.toml`（建议部署在自己的服务器上 7×24 运行，见下文）。
+5. **运行**：部署到服务器 7×24 运行（见下文）。
 
-## 凭证（可选，只放在环境变量中）
+## 凭证与邮箱（放在 .env 或环境变量中，不写进配置文件）
 
 | 变量 | 用途 |
 |---|---|
-| `BINANCE_P20T` | 币安网页登录 cookie `p20t`：浏览器登录 binance.com → 开发者工具 → Application → Cookies |
-| `BINANCE_CSRFTOKEN` | 请求头 `csrftoken`：开发者工具 → Network → 任意 bapi 请求的请求头 |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Telegram 推送：找 @BotFather 创建机器人，向机器人发一条消息后，调用 getUpdates 获取 chat id |
+| `BINANCE_P20T` | 币安网页登录 cookie `p20t`：浏览器登录 binance.com → F12 → Application → Cookies |
+| `BINANCE_CSRFTOKEN` | 请求头 `csrftoken`：F12 → Network → 任意 bapi 请求的请求头（状态显示 “from service worker” 的请求看不到 Cookie，可以用 “Copy as cURL”） |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_TO` | 邮件提醒。163 邮箱：`smtp.163.com`、465（TLS），`SMTP_PASS` 填邮箱设置里开通 SMTP 后获得的**授权码**，不是登录密码 |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 可选：Telegram 推送 |
+
+模板见 [deploy/env.example](deploy/env.example)。程序启动时会读取 `BIAN_ENV_FILE` 指定的文件（默认当前目录的 `.env`），但不会覆盖已有的环境变量。
 
 ⚠️ `p20t` 等同于你的登录会话。不要发给任何人，不要写进配置文件或提交到 git。它通常 7–30 天过期，过期时 monitor 会发紧急提醒，按上面的步骤重新获取即可。
 
@@ -60,7 +64,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 | A02 | 该跟单未设置原生“总止损”（每天提醒一次，附建议金额） | 信息 |
 | A03 | 距原生总止损触发只剩止损额的 30% | 紧急 |
 | A04 | 跟单处于暂停状态 | 信息 |
-| R01 / R02 / R03 | ROI ≤ -20% / -35% / 计划硬止损线 -40%（R03 持续触发时每 30 分钟重复提醒） | 警告 / 紧急 / 紧急 |
+| L1 / L2 / L3 | **仓位亏损分档**：默认 ROI -50% / -100% / -150%（可配置；或按价格波动 × 杠杆换算，见下文） | 警告 / 紧急 / 紧急 |
 | R04 | 浮盈达到 +20% → 建议把止损上移到保本价 | 信息 |
 | R05 | 浮盈从最高点回撤 ≥15 个点 → 建议部分止盈或上移止损 | 警告 |
 | R10 | 曾经盈利的单子回到保本线以下 | 紧急 |
@@ -72,22 +76,65 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 口径：同一币种同时持有多单和空单时，按**合并后的净盈亏**评估（单边亏损但整体盈利不报警）；盈亏金额低于 `min_alert_u`（默认 2U）的 ROI 类提醒不发；强平价只在合理范围内使用（实测全仓下经常给出无效值）。
 
-去重和升级：同一仓位版本、同一规则只提醒一次；回升超过阈值 5 个点后重新武装；加仓后视为新版本，重新评估。持仓列表突然变空时，需要连续确认 2 次才判定为平仓。状态存在 SQLite 中，重启后不会重复提醒。
+### 仓位亏损分档通知（L1/L2/L3）
 
-## 7×24 部署（systemd 示例）
+- `loss_tiers = [50, 100, 150]`：亏损百分比档位，口径与币安仓位页的 ROI 一致（浮亏 ÷ 仓位保证金），全仓模式下可以超过 100%。可以按领航员单独设置。
+- `loss_tiers_mode = "price"`：改成按**价格反向波动**设置，例如 `[3, 5, 8]`，系统自动乘以杠杆换算成 ROI（10x → -30/-50/-80%，50x → -150/-250/-400%）。这样同一组档位对不同杠杆的仓位风险尺度一致，解决“高杠杆下 -50% 太容易触发”的问题。
+- 防轰炸：
+  1. 每档对每个仓位只通知一次；跌到更高档立即再通知（升级不受冷却限制），直接跳档只发最高档一条。
+  2. 亏损回升到“档位 − min(10, 档位/2)”以上才重新启用该档，避免在阈值附近来回波动时反复发信。
+  3. 同一仓位两条通知至少间隔 15 分钟（升级除外），每天最多 4 条。
+  4. 领航员边亏边加仓时**不重置档位**，只单独发一条加仓提醒。
+  5. 盈亏金额小于 2U、或多空对冲后整体没有亏到档位的，不通知。
+  6. 停机期间平仓后又重新开的仓位（开仓价不同），重启后按新仓位处理。
+- 通知内容包括：达到第几档、当前 ROI 和 U 金额、开仓价/现价，以及下一档对应的价格（可以作为止损价参考）。系统无法通知领航员本人，请你在币安该跟单仓位设置止损或手动平仓。
 
-```ini
-# /etc/systemd/system/bian.service
-[Service]
-WorkingDirectory=/opt/bian
-EnvironmentFile=/opt/bian/.env   # 放 BINANCE_P20T 等，chmod 600
-ExecStart=/opt/bian/.venv/bin/bian monitor -c /opt/bian/config.toml
-Restart=always
-[Install]
-WantedBy=multi-user.target
+### 去重与邮件
+
+- 其他规则：同一仓位版本、同一规则只提醒一次，回升超过阈值后重新启用。持仓列表突然变空时，需要连续确认 2 次才判定为平仓。状态存在 SQLite 中，重启后不会重复提醒。
+- 邮件：同一轮轮询的提醒**合并成一封**，紧急的排在前面；默认只发“提醒/紧急”级别（`email_min_severity = "warn"`），信息级（开仓、启动汇总、每日“未设总止损”）只写日志；每小时最多 12 封，超出的稍后合并补发；发送失败 5 分钟后重试。每条提醒的投递结果都写入数据库，`bian alerts` 可以查看（控制台输出不算“已送达”）。
+
+## 部署到服务器（可以与其他项目共存）
+
+适用于 Ubuntu 22.04+/24.04。实测资源占用：单个 Python 进程，内存几十 MB；每 20 秒约 7 个请求，每个几 KB；**不监听任何端口**，不需要修改安全组。与同机的其他项目（例如 `/opt/nofx` 下用 Docker 运行的 joz）完全隔离：
+
+- 代码在 `/opt/bian`，配置、数据库、缓存在 `/opt/bian/data`，凭证和邮箱在 `/opt/bian/.env`（权限 600）。
+- 以独立系统用户 `bian` 运行 systemd 服务 `bian`，并限制资源：`MemoryMax=256M`、`CPUWeight=50`、`Nice=10`；除 `/opt/bian/data` 外文件系统只读。
+- 不使用 Docker，也不加入其他项目的 docker-compose：其他项目重新构建时，不会影响监控。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/linlea666/bian/main/deploy/install.sh -o /tmp/bian-install.sh
 ```
 
-服务器需要能访问 `www.binance.com`。如果服务器在受限地区，`fapi.binance.com` 会返回 451，本工具已统一改走 `www.binance.com/fapi`。
+```bash
+sudo bash /tmp/bian-install.sh
+```
+
+（分支不是 `main` 时，把 URL 里的 `main` 换成分支名，并加上 `BIAN_BRANCH=分支名`：`sudo BIAN_BRANCH=分支名 bash /tmp/bian-install.sh`。）
+
+安装后：
+
+```bash
+nano /opt/bian/.env
+```
+
+```bash
+bian doctor --test-email
+```
+
+```bash
+systemctl restart bian
+```
+
+```bash
+journalctl -u bian -f
+```
+
+- 阈值等配置：`/opt/bian/data/config.toml`，修改后执行 `systemctl restart bian`。
+- 更新代码：`sudo bash /opt/bian/deploy/update.sh`（几秒钟完成；保留 .env、配置和数据库）。
+- 凭证过期（通常 7–30 天，会收到紧急提醒）：重新登录币安网页，更新 `.env` 里的两项，然后 `systemctl restart bian`。
+- 服务器需要能访问 `www.binance.com`：部分地区 `fapi.binance.com` 会返回 451，本工具统一走 `www.binance.com/fapi`，`bian doctor` 会逐项检查。
+- 阿里云等云服务器默认封禁 25 端口，邮件请用 465 或 587。
 
 ## 精度与限制
 

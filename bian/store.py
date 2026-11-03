@@ -29,12 +29,21 @@ class Store:
         self.db.executescript(SCHEMA)
         self._last_digest: dict[str, str] = {}
 
-    def add_alert(self, a, message: str, delivered: bool, error: str) -> None:
-        self.db.execute(
+    def add_alert(self, a, message: str, delivered: bool, error: str) -> int:
+        cur = self.db.execute(
             "INSERT INTO alerts (ts, rule_id, severity, key, version, title, detail, suggestion, message, delivered, error)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (a.ts or time.time(), a.rule_id, a.severity, a.key, a.version, a.title, a.detail,
              a.suggestion, message, int(delivered), error),
+        )
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def update_delivery(self, row_id: int, delivered: bool, error: str) -> None:
+        """回写投递结果；一旦送达（任一渠道）就保持已送达。"""
+        self.db.execute(
+            "UPDATE alerts SET delivered = MAX(delivered, ?), error = ? WHERE id = ?",
+            (int(delivered), error, row_id),
         )
         self.db.commit()
 

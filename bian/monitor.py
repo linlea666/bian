@@ -9,7 +9,7 @@ from .client import AuthExpired, BinanceError, Client, RateLimited
 from .config import AppConfig, LeaderConfig
 from .exposure import describe_legs, net_by_symbol
 from .models import Position
-from .notify import Notifier
+from .notify import Notifier, Outgoing, deliver_all
 from .rules import (
     AccountSnapshot, AccountState, Alert, PortfolioState, PosState, RuleConfig,
     evaluate, evaluate_account, evaluate_portfolio,
@@ -47,6 +47,7 @@ class Monitor:
             k: AccountState.from_dict(v) for k, v in saved.items() if k.startswith("acct:")
         }
         self.portfolio = PortfolioState()
+        self.outbox: list[Outgoing] = []
         self.auth_alerted = False
         self.leaders = [LeaderRuntime(c, cfg.rules.merged(c.rules)) for c in cfg.leaders]
 
@@ -90,6 +91,7 @@ class Monitor:
                 self._send(Alert("R08", "warn", f"leader:{pid}", 0, f"[{lr.name}] 无法监控持仓",
                                  lr.blocked_reason, ts=self.clock()))
             print(f"[{lr.name}] 数据源={lr.source}" + (f"（{lr.blocked_reason}）" if lr.blocked_reason else ""))
+        self.flush()
 
     # -------------------------------------------------------------- poll
     def fetch(self, lr: LeaderRuntime) -> list[Position]:
@@ -116,6 +118,7 @@ class Monitor:
             sent += self._process(lr, positions, now)
         sent += self._accounts(now)
         sent += self._portfolio(now)
+        self.flush(now)
         return sent
 
     def _accounts(self, now: float) -> list[Alert]:
@@ -180,6 +183,8 @@ class Monitor:
         prev_symbols = {k.split(":")[1] for k in self.states if k.startswith(prefix)}
         cur_symbols = {p.symbol for p in current.values()}
         summary: list[str] = []
+        if not lr.initialized:
+            self._drop_stale_states(current, now)
         for key, pos in current.items():
             known = key in self.states
             st, alerts = evaluate(pos, self.states.get(key), lr.rules, now, self._margin_u(lr, pos))
@@ -240,6 +245,19 @@ class Monitor:
         self.portfolio, alert = evaluate_portfolio(est, self.cfg.loss_budget_u, self.portfolio, now)
         return [self._send(alert)] if alert else []
 
+    STALE_STATE_SECONDS = 600
+
+    def _drop_stale_states(self, current: dict[str, Position], now: float) -> None:
+        """启动时：超过 10 分钟没观察到、且开仓价已经变了的状态视为旧仓位（停机期间已平仓又重新开），
+        清掉后按新仓位处理，避免继承旧的“已通知”状态（参考 nofx-1 的 10 分钟过期）。"""
+        for key, pos in current.items():
+            st = self.states.get(key)
+            if not st or now - st.last_seen <= self.STALE_STATE_SECONDS or pos.is_hedge:
+                continue
+            if st.entry_price > 0 and abs(pos.entry_price / st.entry_price - 1) > 1e-6:
+                self.states.pop(key)
+                self.store.delete_state(key)
+
     @staticmethod
     def _margin_u(lr: LeaderRuntime, pos: Position) -> float | None:
         """我在该仓位上的保证金（U），用于换算盈亏金额。"""
@@ -292,12 +310,18 @@ class Monitor:
         return "\n".join(lines)
 
     def _send(self, a: Alert, lr: LeaderRuntime | None = None, pos: Position | None = None) -> Alert:
+        """写入审计表并放进发件箱；本轮结束时由 flush() 统一投递（邮件会合并成一封）。"""
         msg = self.format(a, lr, pos)
-        ok, err = self.notifier.send(msg, a.severity)
-        self.store.add_alert(a, msg, ok, err)
-        if not ok:
-            print(f"通知发送失败（已记录）：{err}")
+        row_id = self.store.add_alert(a, msg, False, "待发送")
+        self.outbox.append(Outgoing(row_id, msg, a.severity, a.ts or self.clock()))
         return a
+
+    def flush(self, now: float | None = None) -> None:
+        items, self.outbox = self.outbox, []
+        for it, ok, err in deliver_all(self.notifier, items, now if now is not None else self.clock()):
+            self.store.update_delivery(it.row_id, ok, err)
+            if not ok:
+                print(f"通知未送达（已记录，可能稍后重试）：{err}")
 
     def run(self) -> None:
         self.setup()

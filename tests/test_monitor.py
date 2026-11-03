@@ -86,16 +86,16 @@ def test_ac06_stale_data_alert_and_recovery():
 
 def test_restart_does_not_resend(tmp_path):
     db = str(tmp_path / "t.db")
-    mon, _ = make([[p(-0.25)]], db=db)
-    assert rules(mon.poll_once()) == ["R01", "R00"]  # 预警单发 + 启动汇总
+    mon, _ = make([[p(-0.6)]], db=db)
+    assert rules(mon.poll_once()) == ["L1", "R00"]  # 亏损通知单发 + 启动汇总
     n = FakeNotifier()
-    mon2, _ = make([[p(-0.26)]], notifier=n, db=db)
+    mon2, _ = make([[p(-0.61)]], notifier=n, db=db)
     assert rules(mon2.poll_once()) == []
 
 
 def test_message_content_and_failed_delivery_recorded():
     n = FakeNotifier(ok=False)
-    mon, _ = make([[p(-0.41)]], notifier=n)
+    mon, _ = make([[p(-1.2)]], notifier=n)
     mon.poll_once()
     sev, text = n.msgs[0]  # 紧急提醒先发，启动汇总在后
     assert sev == "urgent" and "ETHUSDT 多 10x" in text and "lead-details/L" in text
@@ -173,3 +173,21 @@ def test_hedge_transition_is_not_open_or_close():
     assert "L:ETHUSDT:HEDGE" in mon.states
     clock.t += 20
     assert rules(mon.poll_once()) == []
+
+
+def test_restart_after_downtime_with_new_entry_is_new_position(tmp_path):
+    db = str(tmp_path / "t.db")
+    mon, clock = make([[p(-0.6)]], db=db)
+    mon.poll_once()  # 旧仓位已发 L1
+    # 停机 1 小时，期间平仓后同币种重新开仓（开仓价不同）
+    newpos = Position("L", "ETHUSDT", "LONG", 1.0, 90.0, 90 * (1 - 0.06), 10, -5.4, "public")
+    mon2, clock2 = make([[newpos]], db=db)
+    clock2.t = clock.t + 3600
+    assert rules(mon2.poll_once()) == ["L1", "R00"]  # 新仓位重新通知
+
+
+def test_flush_records_delivery_result():
+    mon, _ = make([[p(-1.2)]])
+    mon.poll_once()
+    rows = mon.store.db.execute("SELECT rule_id, delivered, error FROM alerts").fetchall()
+    assert rows and all(r[1] == 1 and r[2] == "" for r in rows)
