@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from bian import notify
 from bian.curl_parse import CurlParseError, parse_credentials
 from bian.rules import RuleConfig
 from bian.settings import PRESETS, Settings, SettingsError, mask, public_view
@@ -98,5 +99,28 @@ def test_import_legacy_once(st):
     assert set(imported) == {"风控参数", "邮箱", "币安凭证"}
     cfg = st.get()
     assert cfg["rules"]["loss_tiers"] == [30.0, 60.0] and cfg["preset"] == "custom"
-    assert cfg["notify"]["email_min_severity"] == "urgent" and st.binance_credentials() == (P20T, CSRF)
+    assert cfg["notify"]["email_events"] == notify.URGENT_EVENTS and st.binance_credentials() == (P20T, CSRF)
     assert st.import_legacy(app_cfg, env) == []  # 只导入一次
+
+
+
+def test_upgrade_old_notify_and_rules(tmp_path):
+    """旧版配置：按级别发邮件 → 按事件；每小时 12 封（旧默认）→ 6；去掉已删除的参数。"""
+    import json
+    import sqlite3
+
+    st = Settings(str(tmp_path / "a.db"), str(tmp_path / "s.json"))
+    old = {"notify": {"email_min_severity": "warn", "email_max_per_hour": 12},
+           "rules": {"urgent_repeat_minutes": 30, "loss_tiers": [50, 100]},
+           "leader_rules": {"L": {"urgent_repeat_minutes": 5, "min_alert_u": 3}}}
+    with sqlite3.connect(tmp_path / "a.db") as db:
+        db.execute("INSERT INTO settings VALUES ('app', ?, 1)", (json.dumps(old),))
+    cfg = st.get()
+    assert cfg["notify"]["email_events"] == notify.DEFAULT_EVENTS and cfg["notify"]["email_max_per_hour"] == 6
+    assert "email_min_severity" not in cfg["notify"] and cfg["notify"]["email_batch_minutes"] == 60
+    assert "urgent_repeat_minutes" not in cfg["rules"] and cfg["leader_rules"] == {"L": {"min_alert_u": 3}}
+    st.save(cfg)  # 升级后的配置可以正常保存
+    with pytest.raises(SettingsError):
+        st.update({"notify": {"email_events": ["loss_tier", "nope"]}})
+    new, changed = st.update({"notify": {"email_events": ["liquidation", "loss_tier"], "email_batch_minutes": 0}})
+    assert new["notify"]["email_events"] == ["loss_tier", "liquidation"] and "notify.email_events" in changed

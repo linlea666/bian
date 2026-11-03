@@ -10,7 +10,7 @@ from .config import AppConfig
 from .credentials import CredentialGuard
 from .lifecycle import EpisodeRecorder
 from .monitor import Monitor
-from .notify import EmailNotifier, MultiNotifier, StdoutNotifier, describe_smtp_error, smtp_send
+from .notify import HELD, EmailNotifier, MultiNotifier, Outgoing, StdoutNotifier, describe_smtp_error, smtp_send
 from .rules import Alert
 from .settings import Settings
 from .store import LocalStore, Store
@@ -46,13 +46,40 @@ class App:
         n = cfg["notify"]
         smtp = self.settings.smtp_config(cfg) if n["email_enabled"] else None
         key = (smtp and (smtp.host, smtp.port, smtp.user, smtp.password, tuple(smtp.to), smtp.security),
-               n["email_min_severity"], n["email_max_per_hour"])
+               tuple(n["email_events"]), n["email_batch_minutes"], n["email_max_per_hour"])
         if key != self._notifier_key:
+            old = self._email()
             parts = [StdoutNotifier()]
             if smtp:
-                parts.append(EmailNotifier(smtp, n["email_min_severity"], n["email_max_per_hour"]))
+                em = EmailNotifier(smtp, max_per_hour=n["email_max_per_hour"], events=n["email_events"],
+                                   batch_minutes=n["email_batch_minutes"])
+                if old:  # 改设置不能丢掉正在等待合并的提醒（按旧设置已决定要发）和本小时的发送计数
+                    em.pending = list(old.pending)
+                    em.sent_times, em.retry_at = old.sent_times, old.retry_at
+                parts.append(em)
             self._notifier, self._notifier_key = MultiNotifier(parts), key
         return self._notifier
+
+    def _email(self) -> EmailNotifier | None:
+        return next((n for n in getattr(self._notifier, "notifiers", []) if isinstance(n, EmailNotifier)), None)
+
+    HELD_RESTORE_S = 6 * 3600
+
+    def restore_held(self, store) -> int:
+        """服务重启后，把还在排队（等待合并 / 每小时上限 / 等待重试）的邮件提醒放回队列；
+        超过 6 小时的不再补发，标记为过期。返回恢复的条数。"""
+        rows = store.db.execute(
+            "SELECT id, ts, rule_id, severity, message FROM alerts WHERE delivered=0 AND error LIKE '%email:%' "
+            "AND (error LIKE ? OR error LIKE '%达到每小时上限%' OR error LIKE '%等待重试%') ORDER BY id",
+            (f"%{HELD}%",)).fetchall()
+        em, now, n = self._email(), self.clock(), 0
+        for rid, ts, rule_id, sev, msg in rows:
+            if em and now - (ts or 0) < self.HELD_RESTORE_S:
+                em.requeue([Outgoing(rid, msg or "", sev, ts or now, rule_id or "")])
+                n += 1
+            else:
+                store.update_delivery(rid, False, "email: 服务重启，已过期未发送")
+        return n
 
     def send_urgent(self, title: str, body: str, severity: str = "urgent") -> tuple[bool, str]:
         """凭证失效 / 恢复等系统通知：立即发送，不受邮件级别过滤和每小时上限限制。"""
@@ -100,6 +127,8 @@ class App:
                                recorder=EpisodeRecorder(store, self.clock),
                                rules_provider=lambda pid: self.settings.rules_config(pid))
         store.log_event("service.start", "风控服务已启动")
+        if self.restore_held(store):
+            print("已恢复重启前等待发送的邮件提醒", flush=True)
         self.guard.tick(force=True)
         try:
             self.monitor.setup()
@@ -153,6 +182,7 @@ class App:
             if sync.ensure_leader(store, lc.portfolio_id, lc.name or lc.portfolio_id, "watch"):
                 jobs.enqueue(store, lc.portfolio_id, "观察中的领航员")
         errors: dict[str, float] = {}
+        backfill_due = [True]
 
         def guarded(name: str, fn) -> None:
             try:
@@ -184,7 +214,11 @@ class App:
                 if sync.ensure_leader(store, lid, str(rel.get("nickname") or lid), "copy"):
                     jobs.enqueue(store, lid, "新跟单的领航员")
                 # 每个跟单关系单独处理：一个出错不影响其他关系
-                guarded(f"同步跟单 {lid}", lambda rel=rel: sync.sync_copy_relation(private, store, rel, full=full))
+                guarded(f"同步跟单 {lid}", lambda rel=rel: sync_one(rel, full))
+
+        def sync_one(rel: dict, full: bool) -> None:
+            if sync.sync_copy_relation(private, store, rel, full=full)["positions"]:
+                backfill_due[0] = True  # 有新的历史仓位：检查有没有实时监控漏掉的平仓
 
         def one_leader(lid: str) -> None:
             # 每个领航员单独处理：一个出错（例如已关闭带单）不影响其他领航员
@@ -199,7 +233,9 @@ class App:
                 for lid in hot:
                     one_leader(lid)
                 last["hot"] = now
-            for lid, synced in store.db.execute("SELECT lead_id, history_synced FROM leaders").fetchall():
+            for lid, synced, kind in store.db.execute("SELECT lead_id, history_synced, kind FROM leaders").fetchall():
+                if kind == "ended":
+                    continue  # 已停止跟单：不再每天同步和分析；还有离场等结算时由上面的热点同步负责
                 if not synced or now - synced >= self.LEADER_DAILY_S:
                     one_leader(lid)
                     # 失败时也记下时间，避免每轮重试同一个出错的领航员
@@ -211,6 +247,9 @@ class App:
         def judge() -> None:
             now = self.clock()
             poll = self.cfg.poll_seconds
+            if backfill_due[0]:  # 只在启动时和同步到新历史仓位后运行；只查本地库，不请求币安
+                backfill_due[0] = False
+                exits.backfill(store, poll, now)
             exits.resolve(store, poll, now)  # 结论写入 exits 表和事件日志，进统计页和每日摘要
             store.set_runtime("residuals", exits.residuals(store, poll, now))
 

@@ -30,7 +30,11 @@ const HELP = {
   equity_change: "权益变化：（权益 − 净投入）的变化，包含浮动盈亏，已扣除追加 / 赎回。安装后才开始记录。",
   carry: "扛单率：最终盈利的单子里，途中浮亏曾超过 -30% 的比例。越高说明领航员越爱扛单，设太紧的止损容易被误杀。",
   giveback: "利润回吐率：浮盈曾经超过 20% 的单子，最后回吐了一半以上的比例。越高越适合自己分批止盈。",
-  severity: "邮件级别：信息（开仓、启动汇总等）、提醒（第 1 档亏损、回撤等）、紧急（更高档亏损、凭证失效等）。凭证失效邮件无论如何都会发。",
+  email_events: "只有勾选的事件才发邮件，其余只在后台记录（每日摘要里会汇总条数）。同一事件当天只发一次，明显恶化才再发；紧急的立即发，其余按汇总间隔合并成一封。凭证失效邮件无论如何都会发。",
+  rec_tiers: "推荐的亏损档位：取他历史上最后赚钱的单子，持仓过程中最深浮亏的 75% / 90% / 97% 分位。意思是大多数最后赚钱的单子不会跌到这么深，提醒响了说明这一单比他平时扛得更深。",
+  rec_stop: "跟单总止损比例：他近 90 天最大回撤 × 1.2。正常波动不会触发，真失控时由币安自动全部平仓兜底。采用后，作战室里“建议总止损金额”按这个比例计算，需要你在币安自己设置。",
+  ladder: "分批止盈阶梯：按他盈利单通常能涨到的浮盈（中位数 / 75% 分位）分批止盈，和“不止盈”对比。只有用前 70% 的历史选出、在后 30% 也更好的方案才推荐。采用后浮盈到位时提醒你在币安手动止盈（默认不发邮件）。",
+  ended: "已停止跟单：你在币安已经不再跟这个领航员。数据默认一直保留；可以导出备份，或删除他的全部数据（删除前会自动备份一份到服务器）。",
 };
 const help = (k) => HELP[k] ? `<span class="help" data-help="${k}" tabindex="0" role="button" aria-label="说明">?</span>` : "";
 
@@ -389,7 +393,7 @@ async function pageRecords(tab) {
     body = alerts.length ? `<div class="log">${alerts.map((a) => `<div class="ev">
         <div class="tm">${dt(a.ts)}<br><span class="badge ${a.severity === "urgent" ? "red" : a.severity === "warn" ? "yellow" : ""}">${{ urgent: "紧急", warn: "提醒", info: "信息" }[a.severity] || a.severity}</span></div>
         <div><b>${esc(a.title)}</b>
-          <div class="small ${a.delivered ? "muted" : "down"}">${a.delivered ? "✓ 已送达" : "✗ 未送达"}${a.error ? " · " + esc(a.error) : ""}</div>
+          ${deliveryLine(a)}
           <details><summary class="small muted">查看完整内容</summary><pre>${esc(a.message)}</pre></details></div></div>`).join("")}</div>`
       : `<div class="empty">还没有提醒</div>`;
   } else if (tab === "exits") {
@@ -541,12 +545,16 @@ function emailForm() {
         <div class="hint">不是邮箱登录密码。163：设置 → POP3/SMTP/IMAP → 开启 SMTP 服务</div></label>
       <label class="f"><span>收件邮箱</span><input name="smtp_to" value="${esc(n.smtp_to)}" placeholder="不填则发给发件邮箱"><div class="hint">多个用逗号分隔</div></label>
     </div>
+    <fieldset><legend>哪些事件发邮件 ${help("email_events")}</legend>
+      <div class="chips-row">快速选择：<button type="button" class="btn sm" data-evp="key">只发关键的（推荐）</button>
+        <button type="button" class="btn sm" data-evp="urgent">只发紧急的</button><button type="button" class="btn sm" data-evp="all">全部</button></div>
+      <div class="ev-grid">${(S.settings.email_event_groups || []).map((g) => `<label class="chk"><input type="checkbox" name="ev_${g.key}" ${(n.email_events || []).includes(g.key) ? "checked" : ""}> ${esc(g.label)}</label>`).join("")}
+        <label class="chk muted"><input type="checkbox" checked disabled> 币安凭证失效（始终发送）</label></div>
+      <div class="hint">没勾选的只在后台“记录 → 提醒记录”里保存，并在每日摘要里汇总条数。同一事件当天只发一次，明显恶化（例如亏损跌到下一档、回撤再加深 5 个点）才会再发。</div>
+    </fieldset>
     <div class="row">
-      <label class="f"><span>发送哪些提醒 ${help("severity")}</span><select name="email_min_severity">
-        <option value="warn" ${n.email_min_severity === "warn" ? "selected" : ""}>提醒和紧急（推荐）</option>
-        <option value="urgent" ${n.email_min_severity === "urgent" ? "selected" : ""}>只发紧急</option>
-        <option value="info" ${n.email_min_severity === "info" ? "selected" : ""}>全部（包括开仓等信息）</option></select></label>
-      <label class="f"><span>每小时最多几封</span><input name="email_max_per_hour" type="number" min="1" max="120" value="${esc(n.email_max_per_hour)}"><div class="hint">同一轮的多条提醒会合并成一封</div></label>
+      <label class="f"><span>非紧急提醒汇总间隔（分钟）</span><input name="email_batch_minutes" type="number" min="0" max="240" value="${esc(n.email_batch_minutes)}"><div class="hint">攒够这么久合并成一封；紧急的立即发并顺带捎上。0 = 每次立即发</div></label>
+      <label class="f"><span>每小时最多几封</span><input name="email_max_per_hour" type="number" min="1" max="120" value="${esc(n.email_max_per_hour)}"><div class="hint">兜底上限，超出的合并到下一封</div></label>
     </div>
     <div class="actions"><button class="btn primary" type="submit">保存</button><button class="btn" type="button" id="emailTest">发送测试邮件</button></div>
     <div id="emailMsg"></div>
@@ -557,13 +565,18 @@ function emailPayload(f) {
   const d = new FormData(f);
   const p = { notify: { email_enabled: d.get("email_enabled") === "on", smtp_host: d.get("smtp_host").trim(), smtp_port: Number(d.get("smtp_port") || 465),
     smtp_security: d.get("smtp_security"), smtp_user: d.get("smtp_user").trim(), smtp_to: d.get("smtp_to").trim(),
-    email_min_severity: d.get("email_min_severity"), email_max_per_hour: Number(d.get("email_max_per_hour") || 12) } };
+    email_events: (S.settings.email_event_groups || []).map((g) => g.key).filter((k) => d.get("ev_" + k) === "on"),
+    email_batch_minutes: Number(d.get("email_batch_minutes") || 0), email_max_per_hour: Number(d.get("email_max_per_hour") || 6) } };
   if (d.get("smtp_pass")) p.smtp_pass = d.get("smtp_pass");
   return p;
 }
 function bindEmailForm(after) {
   const f = document.getElementById("emailForm");
   if (!f) return;
+  f.querySelectorAll("[data-evp]").forEach((b) => (b.onclick = () => {
+    const keys = (S.settings.email_event_presets || {})[b.dataset.evp] || [];
+    (S.settings.email_event_groups || []).forEach((g) => { const el = f.elements["ev_" + g.key]; if (el) el.checked = keys.includes(g.key); });
+  }));
   const box = () => document.getElementById("emailMsg");
   f.onsubmit = async (e) => {
     e.preventDefault();
@@ -652,6 +665,14 @@ function readRules(f, prefix = "r_", only) {
   return out;
 }
 const OVERRIDE_KEYS = ["loss_tiers", "loss_tiers_mode", "min_alert_u", "recommend_total_stop_pct"];
+const OV_NAMES = { loss_tiers: "亏损档位", loss_tiers_mode: "档位方式", min_alert_u: "金额门槛", recommend_total_stop_pct: "建议总止损比例", tp_ladder: "分批止盈" };
+const ladderText = (lv) => (lv || []).map(([r, f]) => `+${Math.round(r * 100)}% 平 ${Math.abs(f - 1 / 3) < 1e-6 ? "1/3" : Math.round(f * 100) + "%"}`).join(" → ");
+function fmtOv(k, v) {
+  if (k === "tp_ladder") return ladderText(v) || "关闭";
+  if (k === "recommend_total_stop_pct") return Math.round(v * 100) + "%";
+  if (k === "loss_tiers_mode") return v === "price" ? "按价格波动" : "按 ROI";
+  return Array.isArray(v) ? v.join("/") : v;
+}
 function rulesForm(st) {
   const r = st.rules, m = st.monitor;
   const names = Object.fromEntries((st.leaders || []).map((l) => [l.id, l.name]));
@@ -671,7 +692,7 @@ function rulesForm(st) {
     <h3 style="margin-top:18px">按领航员单独设置</h3>
     <p class="muted small">例如某个领航员杠杆很高，可以单独把亏损档位调大，或改成“按价格波动”。没设置的领航员用上面的全局参数。</p>
     ${overrides.length ? `<div class="tbl-wrap"><table><thead><tr><th>领航员</th><th>单独设置</th><th></th></tr></thead><tbody>${overrides.map(([id, o]) =>
-      `<tr><td>${esc(names[id] || id)}</td><td class="small">${Object.entries(o).map(([k, v]) => `${esc(k)} = ${esc(Array.isArray(v) ? v.join("/") : v)}`).join("；")}</td>
+      `<tr><td>${esc(names[id] || id)}</td><td class="small">${Object.entries(o).map(([k, v]) => `${esc(OV_NAMES[k] || k)} = ${esc(fmtOv(k, v))}`).join("；")}</td>
        <td><button class="btn sm" data-unset="${esc(id)}">恢复全局</button></td></tr>`).join("")}</tbody></table></div>` : ""}
     <form id="ovForm" class="card" style="margin-top:10px">
       <label class="f"><span>选择领航员</span><select name="leader">${(st.leaders || []).map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("") || '<option value="">（设置凭证后显示你的跟单）</option>'}</select></label>
@@ -701,7 +722,9 @@ function bindRulesForm() {
     const id = of.elements.leader.value, box = document.getElementById("ovMsg");
     if (!id) return;
     const lr = { ...(S.settings.leader_rules || {}) };
-    lr[id] = readRules(of, "o_", OVERRIDE_KEYS);
+    // 只改表单里的这几项；在领航员页“采用”的其他设置（例如止盈阶梯）保留
+    const keep = Object.fromEntries(Object.entries(lr[id] || {}).filter(([k]) => !OVERRIDE_KEYS.includes(k)));
+    lr[id] = { ...keep, ...readRules(of, "o_", OVERRIDE_KEYS) };
     try {
       const r = await api("PUT", "/api/settings", { leader_rules: lr });
       S.settings = r.settings;
@@ -715,6 +738,15 @@ function bindRulesForm() {
     await api("PUT", "/api/settings", { leader_rules: lr });
     pageSettings("rules").then(bindShell);
   }));
+}
+
+/* 提醒的投递状态：有意不发 / 排队等待不是故障，不标红 */
+function deliveryLine(a) {
+  const e = a.error || "";
+  if (a.delivered) return `<div class="small muted">✓ 已送达${e ? " · " + esc(e) : ""}</div>`;
+  if (/按设置不发邮件|低于邮件通知级别/.test(e)) return `<div class="small muted">只在后台记录（按设置不发邮件）</div>`;
+  if (/等待合并|达到每小时上限|等待重试/.test(e)) return `<div class="small" style="color:var(--yellow, #b7791f)">⏳ ${esc(e.replace(/^email: /, ""))}</div>`;
+  return `<div class="small down">✗ 未送达${e ? " · " + esc(e) : ""}</div>`;
 }
 
 /* ---------------- 入口 ---------------- */
@@ -829,11 +861,14 @@ const RANK_COLS = [
   ["win_rate", "我的胜率"], ["payoff", "盈亏比"], ["exits_net_u", "提前离场净效果"], ["carry_rate", "扛单率"], ["giveback_rate", "回吐率"], ["alerts", "提醒数"],
 ];
 async function pageLeaders() {
+  if (S.leadersTab === "discover") return pageDiscover();
   const gen = S.gen;
   const [ov, { leaders }] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/leaders")]);
   if (stale(gen)) return;
   const key = S.rankKey || "pnl", dir = S.rankDir || -1;
-  const sorted = leaders.slice().sort((a, b) => {
+  const endedN = leaders.filter((r) => r.kind === "ended").length;
+  const sorted = leaders.filter((r) => !(S.hideEnded && r.kind === "ended")).sort((a, b) => {
+    if ((a.kind === "ended") !== (b.kind === "ended")) return a.kind === "ended" ? 1 : -1;  // 已停止跟单的排在最后
     const x = a[key], y = b[key];
     if (x == null) return 1; if (y == null) return -1;
     return (typeof x === "string" ? x.localeCompare(y) : x - y) * dir;
@@ -841,11 +876,12 @@ async function pageLeaders() {
   const job = (j) => !j ? "" : j.state === "done" ? "" : j.state === "error" ? '<span class="badge red">分析出错</span>'
     : `<span class="badge yellow">分析中 ${j.total ? `${j.progress}/${j.total}` : ""}</span>`;
   const dev = (d) => !d ? "" : (d.missing || d.over || d.under) ? `<span class="badge yellow" title="超配 ${d.over} · 低配 ${d.under} · 漏单 ${d.missing}">偏差 ${d.over + d.under + d.missing}</span>` : "";
-  root.innerHTML = shell("leaders", "领航员", statusChips(ov), `
-    <div class="card"><div class="card-h"><h2>领航员排行</h2><span class="muted small">点列头排序</span></div>
+  root.innerHTML = shell("leaders", "领航员", statusChips(ov), `${leaderTabs("rank")}
+    <div class="card"><div class="card-h"><h2>领航员排行</h2><span class="muted small">点列头排序
+      ${endedN ? ` · <a href="javascript:void 0" id="toggleEnded">${S.hideEnded ? `显示已停止跟单的 ${endedN} 位` : "隐藏已停止跟单的"}</a>` : ""}</span></div>
     ${sorted.length ? `<div class="tbl-wrap"><table class="cards rank"><thead><tr>${RANK_COLS.map(([k, t]) => `<th class="${k === "name" ? "" : "r"} sort" data-k="${k}">${t}${k === "carry_rate" ? help("carry") : k === "giveback_rate" ? help("giveback") : k === "exits_net_u" ? help("verdict") : ""}${key === k ? (dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("")}</tr></thead><tbody>
       ${sorted.map((r) => `<tr class="click" data-go="${esc(r.lead_id)}">
-        <td data-l="领航员"><b>${esc(r.name)}</b> ${r.kind === "watch" ? '<span class="badge">观察</span>' : ""} ${job(r.job)} ${dev(r.deviation)}<div class="tags">${(r.tags || []).slice(0, 4).map((t) => `<span class="badge">${esc(t)}</span>`).join("")}</div></td>
+        <td data-l="领航员"><b>${esc(r.name)}</b> ${KIND_BADGE[r.kind] || ""} ${job(r.job)} ${dev(r.deviation)}<div class="tags">${(r.tags || []).slice(0, 4).map((t) => `<span class="badge">${esc(t)}</span>`).join("")}</div></td>
         <td data-l="权益" class="r num">${r.equity == null ? "-" : num(r.equity) + "U"}</td>
         <td data-l="累计盈亏" class="r">${r.pnl == null ? "-" : U(r.pnl)}</td>
         <td data-l="本月已实现" class="r">${U(r.month_net)}</td>
@@ -862,6 +898,9 @@ async function pageLeaders() {
       <div class="row"><label class="f"><span>领航员 ID</span><input name="id" inputmode="numeric" placeholder="例如 4708220152086930177"></label>
       <label class="f"><span>备注名（可选）</span><input name="name"></label></div>
       <button class="btn">开始分析</button><div id="watchMsg"></div></form>`);
+  bindLeaderTabs();
+  const te = document.getElementById("toggleEnded");
+  if (te) te.onclick = () => { S.hideEnded = !S.hideEnded; pageLeaders().then(bindShell); };
   root.querySelectorAll("th.sort").forEach((th) => (th.onclick = (e) => {
     if (e.target.closest("[data-help]")) return;
     S.rankDir = S.rankKey === th.dataset.k ? -(S.rankDir || -1) : -1; S.rankKey = th.dataset.k; pageLeaders().then(bindShell);
@@ -873,6 +912,64 @@ async function pageLeaders() {
     try { const r = await api("POST", "/api/leaders/analyze", { id: f.get("id").trim(), name: f.get("name").trim() }); box.innerHTML = `<div class="msg ok">${esc(r.message)}</div>`; setTimeout(() => pageLeaders().then(bindShell), 1200); }
     catch (err) { box.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
   };
+}
+
+const KIND_BADGE = { watch: '<span class="badge">观察</span>', ended: '<span class="badge">已停止跟单</span>' };
+function leaderTabs(cur) {
+  return `<div class="tabs">${[["rank", "排行"], ["discover", "发现领航员"]].map(([k, t]) =>
+    `<button class="tab ${cur === k ? "on" : ""}" data-ltab="${k}">${t}</button>`).join("")}</div>`;
+}
+function bindLeaderTabs() {
+  root.querySelectorAll("[data-ltab]").forEach((b) => (b.onclick = () => { S.leadersTab = b.dataset.ltab; pageLeaders().then(bindShell); }));
+}
+
+/* ---------- 发现领航员（币安榜单，只读）---------- */
+const DISC = { range: "30D", sort: "ROI", minRoi: "", maxMdd: "50", copierWin: true, hideFull: true, minAum: "" };
+async function pageDiscover() {
+  const gen = S.gen;
+  const f = S.disc || (S.disc = { ...DISC });
+  const [ov, d] = await Promise.all([api("GET", "/api/overview"),
+    api("GET", `/api/discover?range=${f.range}&sort=${f.sort}`).catch((e) => ({ error: e.message, items: [] }))]);
+  if (stale(gen)) return;
+  const list = d.items.filter((x) => (f.minRoi === "" || x.roi >= Number(f.minRoi)) && (f.maxMdd === "" || x.mdd <= Number(f.maxMdd))
+    && (!f.copierWin || x.copier_pnl > 0) && (!f.hideFull || !x.max_copiers || x.copiers < x.max_copiers)
+    && (f.minAum === "" || x.aum >= Number(f.minAum)));
+  const sel = (name, opts, v) => `<select name="${name}">${opts.map(([k, t]) => `<option value="${k}" ${k === v ? "selected" : ""}>${t}</option>`).join("")}</select>`;
+  root.innerHTML = shell("leaders", "领航员", statusChips(ov), `${leaderTabs("discover")}
+    <form class="card" id="discForm"><div class="card-h"><h2>发现领航员</h2><span class="muted small">数据来自币安跟单榜单（前 90 名），10 分钟更新一次</span></div>
+      <div class="row">
+        <label class="f"><span>时间范围</span>${sel("range", [["7D", "7 天"], ["30D", "30 天"], ["90D", "90 天"], ["180D", "180 天"]], f.range)}</label>
+        <label class="f"><span>榜单排序</span>${sel("sort", [["ROI", "收益率"], ["PNL", "收益额"], ["COPIER_PNL", "跟单者盈亏"], ["MDD", "最大回撤"], ["WIN_RATE", "胜率"], ["AUM", "规模"]], f.sort)}</label>
+        <label class="f"><span>收益率至少（%）</span><input name="minRoi" type="number" value="${esc(f.minRoi)}"></label>
+        <label class="f"><span>最大回撤不超过（%）</span><input name="maxMdd" type="number" value="${esc(f.maxMdd)}"></label>
+        <label class="f"><span>规模至少（U）</span><input name="minAum" type="number" value="${esc(f.minAum)}"></label>
+      </div>
+      <label class="chk"><input type="checkbox" name="copierWin" ${f.copierWin ? "checked" : ""}> 只看跟单者整体赚钱的（领航员赚钱不代表跟单者赚钱）</label>
+      <label class="chk"><input type="checkbox" name="hideFull" ${f.hideFull ? "checked" : ""}> 隐藏已满员的</label>
+      <div class="actions"><button class="btn">筛选</button></div></form>
+    <div class="card"><div class="card-h"><h3>符合条件 ${list.length} 位</h3><span class="muted small">点“加入观察”后台会分析他的历史风格和回测（只读）</span></div>
+    ${d.error ? `<div class="msg err">${esc(d.error)}</div>` : list.length ? `<div class="tbl-wrap"><table class="cards"><thead><tr><th>领航员</th><th class="r">收益率</th><th class="r">最大回撤</th><th class="r">胜率</th>
+      <th class="r">跟单者盈亏</th><th class="r">规模</th><th class="r">跟单人数</th><th></th></tr></thead><tbody>
+      ${list.map((x) => `<tr><td data-l="领航员"><b>${esc(x.name)}</b></td><td data-l="收益率" class="r">${pct(x.roi / 100, 0)}</td>
+        <td data-l="最大回撤" class="r num">${num(x.mdd, 1)}%</td><td data-l="胜率" class="r num">${num(x.win_rate, 0)}%</td>
+        <td data-l="跟单者盈亏" class="r">${U(x.copier_pnl, 0)}</td><td data-l="规模" class="r num">${num(x.aum, 0)}U</td>
+        <td data-l="跟单人数" class="r num">${x.copiers}/${x.max_copiers || "-"}</td>
+        <td data-l="">${x.kind ? `<a class="btn sm" href="#/leaders/${esc(x.id)}">查看${x.kind === "copy" ? "（跟单中）" : ""}</a>`
+          : `<button class="btn sm" data-watch="${esc(x.id)}" data-name="${esc(x.name)}">加入观察</button>`}
+          <a class="btn sm ghost" href="https://www.binance.com/zh-CN/copy-trading/lead-details/${esc(x.id)}" target="_blank" rel="noopener">币安 ↗</a></td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="empty">没有符合条件的领航员，放宽一下筛选条件试试</div>`}</div>`);
+  bindLeaderTabs();
+  document.getElementById("discForm").onsubmit = (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    S.disc = { range: fd.get("range"), sort: fd.get("sort"), minRoi: fd.get("minRoi"), maxMdd: fd.get("maxMdd"), minAum: fd.get("minAum"),
+      copierWin: fd.get("copierWin") === "on", hideFull: fd.get("hideFull") === "on" };
+    pageLeaders().then(bindShell);
+  };
+  root.querySelectorAll("[data-watch]").forEach((b) => (b.onclick = async () => {
+    try { const r = await api("POST", "/api/leaders/analyze", { id: b.dataset.watch, name: b.dataset.name }); toast(r.message); pageLeaders().then(bindShell); }
+    catch (err) { toast(err.message); }
+  }));
 }
 
 function scatter(points) {
@@ -888,8 +985,8 @@ function scatter(points) {
     <p class="hint">每个点是一笔历史仓位：越靠左过程中亏得越深，越靠上过程中赚得越多；<span class="up">绿点</span>最终盈利、<span class="down">红点</span>最终亏损。很多绿点在很左边 = 爱扛单，止损太紧会误杀。</p>`;
 }
 function btRows(list) {
-  return `<table><thead><tr><th>方案</th><th class="r">累计收益</th><th class="r">最大回撤</th><th class="r">最差单笔</th><th class="r">误杀盈利单</th></tr></thead><tbody>
-    ${list.filter(Boolean).map((b) => `<tr><td>${esc(b.label)}</td><td class="r">${signed(b.total)}</td><td class="r">${num(b.max_dd)}</td><td class="r">${pct(b.worst, 0)}</td><td class="r">${b.winners_cut}</td></tr>`).join("")}</tbody></table>`;
+  return `<div class="tbl-wrap"><table><thead><tr><th>方案</th><th class="r">累计收益</th><th class="r">最大回撤</th><th class="r">最差单笔</th><th class="r">误杀盈利单</th></tr></thead><tbody>
+    ${list.filter(Boolean).map((b) => `<tr><td>${esc(b.label)}</td><td class="r">${signed(b.total)}</td><td class="r">${num(b.max_dd)}</td><td class="r">${pct(b.worst, 0)}</td><td class="r">${b.winners_cut}</td></tr>`).join("")}</tbody></table></div>`;
 }
 async function pageLeader(id) {
   const gen = S.gen;
@@ -903,8 +1000,12 @@ async function pageLeader(id) {
   // 只观察、从没跟单过的领航员，不显示“我的”结果
   const mine = d.kind === "copy" || d.my_positions.length > 0 || d.exits.length > 0;
   root.innerHTML = shell("leaders", esc(d.name), statusChips(ov), `
-    <div class="card"><div class="card-h"><div><a href="#/leaders" class="small">‹ 领航员排行</a> ${d.kind === "watch" ? '<span class="badge">观察</span>' : '<span class="badge green">跟单中</span>'}</div>
-      <div class="actions"><button class="btn sm" id="reAnalyze">重新分析</button><a class="btn sm ghost" href="${esc(d.link)}" target="_blank" rel="noopener">币安主页 ↗</a></div></div>
+    <div class="card"><div class="card-h"><div><a href="#/leaders" class="small">‹ 领航员排行</a> ${KIND_BADGE[d.kind] || '<span class="badge green">跟单中</span>'}${d.kind === "ended" ? help("ended") : ""}</div>
+      <div class="actions"><button class="btn sm" id="reAnalyze">${d.kind === "ended" ? "转为观察并分析" : "重新分析"}</button>
+        <a class="btn sm" href="/api/leaders/export?id=${esc(d.lead_id)}">导出数据</a>
+        ${d.kind !== "copy" ? '<button class="btn sm ghost" id="delLeader">删除数据</button>' : ""}
+        <a class="btn sm ghost" href="${esc(d.link)}" target="_blank" rel="noopener">币安主页 ↗</a></div></div>
+      ${d.kind === "ended" ? `<p class="small">你在 ${dt(d.ended_ts)} 停止跟单这个领航员。数据会一直保留（不再每天同步他的历史）；可以导出备份，或删除他的全部数据。</p>` : ""}
       <p class="muted small">${jobLine}</p>
       ${p && p.tags && p.tags.length ? `<div class="tags">${p.tags.map((t) => `<span class="badge yellow">${esc(t)}</span>`).join(" ")}</div>` : ""}</div>
     ${mine && r.lead_id ? `<h3 class="section">我在他身上的结果</h3><div class="grid kpis">
@@ -918,6 +1019,7 @@ async function pageLeader(id) {
       ${metric("最大连亏", p.max_loss_streak + " 笔")}${metric("前 5 大亏损占比", num(p.top5_loss_share * 100, 0) + "%")}</div>
       ${!p.sample_ok ? '<p class="hint">⚠️ 样本少于 30 笔，以上结论仅供参考。</p>' : ""}
       <div class="section card"><h3>每笔仓位：过程最深浮亏 vs 最高浮盈</h3>${scatter(d.mae_mfe)}</div>` : ""}
+    ${recCard(d.recommend)}
     ${bt ? `<div class="section grid two"><div class="card"><h3>只设硬止损（币安里能直接设置）</h3>${btRows([bt.baseline, ...bt.stop_only])}</div>
       <div class="card"><h3>全部组合前 10</h3>${btRows([bt.baseline, ...bt.ranked])}
       <p class="hint">${bt.oos.train_best ? `样本外检验：前 ${bt.oos.n_train} 笔选出“${esc(bt.oos.train_best.label)}”，在后 ${bt.oos.n_test} 笔上 ${signed(bt.oos.test_best.total)}（原始跟单 ${signed(bt.oos.test_baseline.total)}）。` : "样本不足，未做样本外检验。"}
@@ -928,7 +1030,49 @@ async function pageLeader(id) {
         <td data-l="开仓价" class="r num">${num(m.avg_cost, 4)}</td><td data-l="平仓价" class="r num">${num(m.avg_close, 4)}</td><td data-l="盈亏" class="r">${U(m.pnl)}</td><td data-l="状态" class="small">${esc(m.status)}</td></tr>`).join("")}</tbody></table></div>`
       : `<div class="empty">还没有同步到你的历史仓位</div>`}</div>`}`);
   document.getElementById("reAnalyze").onclick = async () => { const r2 = await api("POST", "/api/leaders/analyze", { id: d.lead_id, name: d.name }); toast(r2.message); pageLeader(id).then(bindShell); };
+  const del = document.getElementById("delLeader");
+  if (del) del.onclick = async () => {
+    const typed = prompt(`删除“${d.name}”的全部数据（成交、历史仓位、离场判定、仓位回合、提醒、画像和单独设置）。\n删除前会自动备份到服务器 data/backups；统计页的历史盈亏也会去掉他的部分。\n\n请输入领航员名字确认：${d.name}`);
+    if (typed == null) return;
+    try { const r2 = await api("POST", "/api/leaders/delete", { id: d.lead_id, confirm: typed.trim() }); toast(r2.message); location.hash = "#/leaders"; }
+    catch (err) { toast(err.message); }
+  };
+  root.querySelectorAll("[data-adopt]").forEach((b) => (b.onclick = async () => {
+    try { const r2 = await api("POST", "/api/leaders/adopt", { id: d.lead_id, what: b.dataset.adopt }); toast(r2.message); pageLeader(id).then(bindShell); }
+    catch (err) { toast(err.message); }
+  }));
   bindExitsTable(() => pageLeader(id).then(bindShell));
+}
+
+/* ---------- 推荐（第三期）：点“采用”才写入该领航员的单独设置 ---------- */
+const OUTDATED = "这份分析是旧版本生成的（还没有止盈回测和最大回撤），系统会在后台自动重新分析；也可以点上面的“重新分析”。";
+function recCard(r) {
+  if (!r) return "";
+  const cur = r.current || {};
+  const curTiers = (cur.loss_tiers || []).map((t) => `-${t}%`).join(" / ") + (cur.loss_tiers_mode === "price" ? "（按价格波动）" : "");
+  if (!r.ok) return `<div class="section card"><h3>止损 / 止盈推荐</h3><div class="empty">${esc(r.reason || "暂无推荐")}</div></div>`;
+  const notes = (r.tier_notes || []).map((n) => `<li><b>-${n.tier}%</b>：他最后赚钱的单子里约 ${num(n.winners_deeper * 100, 0)}% 曾跌到这里${n.losers_deeper != null ? `；亏钱的单子约 ${num(n.losers_deeper * 100, 0)}% 跌到这里` : ""}</li>`).join("");
+  const hs = r.hard_stop;
+  const lad = r.ladder, curLad = cur.tp_ladder || [];
+  return `<div class="section grid two">
+    <div class="card"><h3>止损档位推荐 ${help("rec_tiers")}</h3>
+      <p>推荐亏损档位：<b>${r.loss_tiers.map((t) => `-${t}%`).join(" / ")}</b> <span class="muted small">（当前：${esc(curTiers)}）</span></p>
+      <ul class="rec-list small">${notes}</ul>
+      ${r.total_stop_pct ? `<p>跟单总止损：<b>净投入 × ${num(r.total_stop_pct * 100, 0)}%</b> ${help("rec_stop")} <span class="muted small">他近 90 天最大回撤 ${num(r.mdd_90d, 1)}%；当前 ${num((cur.recommend_total_stop_pct || 0) * 100, 0)}%</span></p>`
+        : `<p class="muted small">${r.outdated ? OUTDATED : "查不到他的近 90 天最大回撤（不在币安公开榜单上），总止损比例不做推荐。"}</p>`}
+      ${hs ? `<p class="small">硬止损参考（回测）：${esc(hs.label)}，累计 ${signed(hs.total)}（不设止损 ${signed(hs.baseline_total)}），会误杀 ${hs.winners_cut} 笔盈利单${hs.better ? "" : "；<b>不如不设</b>，这个领航员更适合只用提醒 + 总止损兜底"}。</p>` : ""}
+      ${r.my_note ? `<p class="msg">${esc(r.my_note)}</p>` : ""}
+      <div class="actions"><button class="btn primary sm" data-adopt="stops">采用档位${r.total_stop_pct ? "和总止损比例" : ""}</button></div>
+      <p class="hint">基于 ${r.n_paths} 笔算出浮亏的历史仓位。只对这个领航员生效，可在 设置 → 风控参数 → 按领航员单独设置 里修改或恢复全局。</p></div>
+    <div class="card"><h3>分批止盈阶梯 ${help("ladder")}</h3>
+      ${curLad.length ? `<p>当前已开启：<b>${esc(ladderText(curLad))}</b>，其余跟随。浮盈到位时提醒你在币安手动止盈。</p>` : ""}
+      ${lad ? `<p>推荐：<b>${esc(lad.label)}</b></p><p class="small">回测累计 ${signed(lad.total)}，不止盈 ${signed(lad.baseline)}（多 ${signed(lad.gain)}）；会少赚的大单 ${lad.winners_trimmed} 笔。用前 70% 历史选出、后 30% 验证仍更好。</p>
+        <div class="actions"><button class="btn primary sm" data-adopt="ladder">采用止盈阶梯</button></div>`
+        : `<p class="muted small">${r.outdated ? OUTDATED : `暂不推荐：${(r.ladder_candidates || []).length ? "候选方案在样本外没有比“不止盈”更好，这个领航员更适合跟到底。" : "历史仓位还不够做止盈回测（至少需要 10 笔算出浮盈的仓位，且样本外检验需要 30 笔以上）。"}`}</p>`}
+      ${(r.ladder_candidates || []).length ? `<div class="tbl-wrap"><table><thead><tr><th>候选方案</th><th class="r">累计</th><th class="r">比不止盈</th></tr></thead><tbody>
+        ${r.ladder_candidates.map((c) => `<tr><td class="small">${esc(c.label)}</td><td class="r num">${signed(c.total)}</td><td class="r"><span class="num ${tone(rnd(c.gain, 2))}">${signed(c.gain)}</span></td></tr>`).join("")}</tbody></table></div>` : ""}
+      ${curLad.length ? '<div class="actions"><button class="btn sm ghost" data-adopt="clear_ladder">关闭止盈提醒</button></div>' : ""}
+      <p class="hint">收益单位 = 每笔投入 1 份保证金的倍数。止盈提醒默认不发邮件（设置 → 邮件提醒 里可以勾选“分批止盈到位”）。</p></div></div>`;
 }
 
 /* ---------- 仓位时间线 ---------- */

@@ -83,7 +83,7 @@ CREATE TABLE IF NOT EXISTS leader_history (
   PRIMARY KEY (lead_id, position_id)
 );
 CREATE INDEX IF NOT EXISTS idx_lh_open ON leader_history(lead_id, opened_ms);
--- 关注的领航员（跟单中 / 观察）
+-- 关注的领航员（kind：copy 跟单中 / watch 观察 / ended 已停止跟单）
 CREATE TABLE IF NOT EXISTS leaders (
   lead_id TEXT PRIMARY KEY, name TEXT, kind TEXT, added REAL, history_synced REAL, updated REAL
 );
@@ -114,6 +114,9 @@ CREATE INDEX IF NOT EXISTS idx_points ON episode_points(episode_id, ts);
 MIGRATIONS = [
     # (表, 列, 定义)：只增不改，旧库升级时自动补列
     ("equity", "profit_shared", "REAL"),
+    ("leaders", "history_ok", "REAL"),  # 最近一次“成功”同步领航员历史的时间（history_synced 失败时也会写）
+    ("leaders", "ended_ts", "REAL"),  # 停止跟单的时间（kind='ended'）
+    ("exits", "opened_ts", "REAL"),  # 我的仓位开仓时间（历史回补的记录没有回合，用它匹配领航员仓位）
 ]
 
 

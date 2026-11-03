@@ -16,8 +16,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .. import __version__
+from ..csvutil import to_csv
 from ..curl_parse import CurlParseError, parse_credentials
-from .. import exits as exits_mod, jobs as jobs_mod, stats as stats_mod
+from .. import exits as exits_mod, jobs as jobs_mod, leader_data, recommend as recommend_mod, stats as stats_mod
+from ..api import leaders as leaders_api
+from ..client import BinanceError, Client
 from ..lifecycle import episodes, get_episode
 from ..sync import ensure_leader
 from ..notify import SmtpConfig, describe_smtp_error, smtp_send
@@ -328,7 +331,8 @@ def make_handler(app):
 
     def leader_detail(h, q, b, s):
         lid = _lead_id(q)
-        row = app.store.db.execute("SELECT name, kind, added, history_synced FROM leaders WHERE lead_id=?", (lid,)).fetchone()
+        row = app.store.db.execute("SELECT name, kind, added, history_synced, ended_ts FROM leaders WHERE lead_id=?",
+                                   (lid,)).fetchone()
         if not row:
             raise ApiError(404, "还没有这个领航员的数据")
         rank = next((r for r in stats_mod.ranking(app.store) if r["lead_id"] == lid), None)
@@ -339,13 +343,53 @@ def make_handler(app):
         dist = app.store.db.execute(
             "SELECT mae, mfe, pnl FROM leader_history WHERE lead_id=? AND mae IS NOT NULL", (lid,)).fetchall()
         return {
-            "lead_id": lid, "name": row[0], "kind": row[1], "added": row[2], "history_synced": row[3],
+            "lead_id": lid, "name": row[0], "kind": row[1], "added": row[2], "history_synced": row[3], "ended_ts": row[4],
             "ranking": rank, "profile": jobs_mod.get_profile(app.store, lid), "job": jobs_mod.current_job(app.store, lid),
             "my_positions": [dict(zip(cols, r)) for r in cur.fetchall()],
             "exits": exits_mod.exits_list(app.store, 100, lid), "exits_summary": exits_mod.summary(app.store, 0, lid),
             "mae_mfe": [{"mae": r[0], "mfe": r[1], "win": (r[2] or 0) > 0} for r in dist],
             "link": views.LEAD_URL.format(lid),
+            "recommend": recommend_mod.recommend(app.store, app.settings, lid),
         }
+
+    def leader_adopt(h, q, b, s):
+        lid = _lead_id(b)
+        try:
+            out = recommend_mod.adopt(app.store, app.settings, lid, str(b.get("what") or ""))
+        except (ValueError, SettingsError) as e:
+            raise ApiError(400, str(e)) from None
+        app.wake()  # 下一轮立即按新阈值评估
+        return out
+
+    discover_cache: dict = {}
+
+    def discover(h, q, b, s):
+        """币安领航员榜单（只读、公开接口），服务端缓存 10 分钟，前端再按条件筛选。"""
+        rng = q.get("range") if q.get("range") in ("7D", "30D", "90D", "180D") else "30D"
+        sort = q.get("sort") if q.get("sort") in ("ROI", "PNL", "MDD", "WIN_RATE", "AUM", "COPIER_PNL", "SHARP_RATIO") \
+            else "ROI"
+        key = (rng, sort)
+        hit = discover_cache.get(key)
+        if not hit or time.time() - hit[0] > 600:
+            client = discover_cache.setdefault("client", Client(min_interval=1.0))
+            items = []
+            try:
+                for page in (1, 2, 3):  # 接口每页最多 30 条：取前 90 名
+                    _, got = leaders_api.leaderboard(client, time_range=rng, sort_by=sort, page=page, page_size=30)
+                    items += got
+                    if len(got) < 30:
+                        break
+            except BinanceError as e:
+                if not items:
+                    raise ApiError(502, f"读取币安榜单失败：{e}") from None
+            rows = [{"id": x.portfolio_id, "name": x.nickname, "roi": x.roi, "pnl": x.pnl, "mdd": x.mdd,
+                     "win_rate": x.win_rate, "aum": x.aum, "copier_pnl": x.copier_pnl,
+                     "copiers": x.current_copy_count, "max_copiers": x.max_copy_count,
+                     "sharp": x.raw.get("sharpRatio")} for x in items]
+            hit = discover_cache[key] = (time.time(), rows)
+        kinds = dict(app.store.db.execute("SELECT lead_id, kind FROM leaders").fetchall())
+        return {"range": rng, "sort": sort, "fetched_at": hit[0],
+                "items": [{**r, "kind": kinds.get(r["id"])} for r in hit[1]]}
 
     def leader_analyze(h, q, b, s):
         lid = _lead_id(b)
@@ -353,6 +397,30 @@ def make_handler(app):
         queued = jobs_mod.enqueue(app.store, lid, "手动重新分析" if not new else "手动加入观察")
         return {"ok": True, "queued": queued, "message": "已开始分析，几分钟到半小时完成（取决于历史仓位数量）"
                 if queued else "这个领航员已经在分析队列里了"}
+
+    def leader_export(h, q, b, s):
+        lid = _lead_id(q)
+        if not leader_data.leader_row(app.store, lid):
+            raise ApiError(404, "还没有这个领航员的数据")
+        body = leader_data.export_zip(app.store, app.settings, lid)
+        h._send(200, body, "application/zip", {
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'attachment; filename="bian-leader-{lid}-{time.strftime("%Y%m%d-%H%M%S")}.zip"'})
+        return None
+
+    def leader_delete(h, q, b, s):
+        lid = _lead_id(b)
+        row = leader_data.leader_row(app.store, lid)
+        if not row:
+            raise ApiError(404, "还没有这个领航员的数据")
+        if str(b.get("confirm") or "").strip() != (row["name"] or lid):
+            raise ApiError(400, "请输入领航员名字确认删除")
+        try:
+            path, counts = leader_data.delete(app.store, app.settings, lid, os.path.join(app.data_dir, "backups"))
+        except leader_data.DeleteRefused as e:
+            raise ApiError(400, str(e)) from None
+        return {"ok": True, "backup": os.path.basename(path), "deleted": counts,
+                "message": f"已删除，删除前的数据已备份到服务器 data/backups/{os.path.basename(path)}"}
 
     def episode_detail(h, q, b, s):
         try:
@@ -381,9 +449,6 @@ def make_handler(app):
         return {"ok": True}
 
     def events_export(h, q, b, s):
-        import csv
-        import io
-
         rows = app.store.events(
             limit=10000, type_prefix=q.get("type") or None, leader_id=q.get("leader") or None,
             episode_id=int(q["episode"]) if q.get("episode") else None, level=q.get("level") or None,
@@ -394,18 +459,10 @@ def make_handler(app):
             h._send(200, body, "application/json; charset=utf-8",
                     {"Cache-Control": "no-store", "Content-Disposition": f'attachment; filename="bian-events-{stamp}.json"'})
             return None
-        def cell(v) -> str:
-            v = str(v)
-            return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v  # 防止 Excel 把内容当公式执行
-
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["时间", "类型", "级别", "领航员", "回合", "标题", "详情"])
-        for r in rows:
-            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"])), r["type"], r["level"],
-                        r["leader_id"] or "", r["episode_id"] or "", cell(r["title"]),
-                        cell(json.dumps(r["detail"], ensure_ascii=False)) if r["detail"] else ""])
-        body = ("\ufeff" + buf.getvalue()).encode()  # 带 BOM，Excel 直接打开不乱码
+        body = to_csv(["时间", "类型", "级别", "领航员", "回合", "标题", "详情"], (
+            [time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"])), r["type"], r["level"],
+             r["leader_id"] or "", r["episode_id"] or "", r["title"],
+             json.dumps(r["detail"], ensure_ascii=False) if r["detail"] else ""] for r in rows))
         h._send(200, body, "text/csv; charset=utf-8",
                 {"Cache-Control": "no-store", "Content-Disposition": f'attachment; filename="bian-events-{stamp}.csv"'})
         return None
@@ -442,6 +499,10 @@ def make_handler(app):
         ("GET", "/api/exits"): (exits_list, True),
         ("POST", "/api/exits/manual"): (exit_manual, True),
         ("GET", "/api/events/export"): (events_export, True),
+        ("GET", "/api/leaders/export"): (leader_export, True),
+        ("POST", "/api/leaders/adopt"): (leader_adopt, True),
+        ("GET", "/api/discover"): (discover, True),
+        ("POST", "/api/leaders/delete"): (leader_delete, True),
     }
     Handler.status = HTTPStatus
     return Handler

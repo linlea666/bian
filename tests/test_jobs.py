@@ -75,3 +75,13 @@ def test_closed_portfolio_stops_and_temporary_error_backs_off(tmp_path, monkeypa
     jobs.step(store, None, FakeKlines(), cache_dir=str(tmp_path / "k"))
     assert jobs.step(store, None, FakeKlines(), cache_dir=str(tmp_path / "k")) is False  # 10 分钟内不再重试
     assert calls == ["11012030", "500"]
+
+
+def test_outdated_profile_needs_refresh():
+    import json
+    store = Store(":memory:")
+    upsert_leader_history(store, "L", [lh(i, i * 100, i * 100 + 30) for i in range(1, 4)])
+    store.db.execute("INSERT INTO leader_profiles VALUES ('L', ?, 3, ?)", (__import__("time").time(), json.dumps({"profile": {}})))
+    assert jobs.needs_refresh(store, "L")  # 旧版本：没有止盈回测 / 最大回撤
+    store.db.execute("UPDATE leader_profiles SET data=?", (json.dumps({"profile": {}, "ladder": None, "mdd_90d": None}),))
+    assert not jobs.needs_refresh(store, "L")

@@ -251,13 +251,14 @@ def cmd_alerts(a) -> int:
     import time
 
     from .config import load_config
+    from .notify import is_soft
     from .store import Store
 
     for ts, sev, rule, key, title, ok, err in Store(load_config(a.config).db_path).recent_alerts(a.limit):
         note = ""
         if not ok:
             note = f"  [未送达：{err}]"
-        elif err and "低于邮件通知级别" not in err:
+        elif err and not is_soft(err):
             note = f"  [部分渠道：{err}]"
         print(f"{time.strftime('%m-%d %H:%M:%S', time.localtime(ts))} {sev:<6} {rule:<4} {key} {title}{note}")
     return 0

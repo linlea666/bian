@@ -16,6 +16,7 @@ import threading
 import time
 from dataclasses import asdict, fields
 
+from .notify import DEFAULT_EVENTS, EVENT_GROUPS, EVENT_KEYS, URGENT_EVENTS, events_for_severity
 from .rules import RuleConfig
 
 RULE_KEYS = [f.name for f in fields(RuleConfig)]
@@ -43,6 +44,7 @@ PRESET_NAMES = {"conservative": "保守", "balanced": "均衡", "aggressive": "�
 def _rule_defaults() -> dict:
     d = asdict(RuleConfig())
     d["loss_tiers"] = list(d["loss_tiers"])
+    d["tp_ladder"] = [list(x) for x in d["tp_ladder"]]
     d.update(PRESETS["balanced"])
     return d
 
@@ -53,8 +55,9 @@ DEFAULTS: dict = {
     "leader_rules": {},  # 领航员 ID -> 覆盖的规则字段
     "notify": {
         "email_enabled": True,
-        "email_min_severity": "warn",
-        "email_max_per_hour": 12,
+        "email_events": list(DEFAULT_EVENTS),  # 哪些事件发邮件（其余只在后台记录，并进每日摘要）
+        "email_batch_minutes": 60,  # 非紧急提醒攒多久汇总一封；0 = 立即发。紧急的始终立即发
+        "email_max_per_hour": 6,
         "smtp_host": "smtp.163.com",
         "smtp_port": 465,
         "smtp_security": "",
@@ -101,6 +104,25 @@ def mask(secret: str | None) -> str:
     return f"{head}****{secret[-3:]}"
 
 
+def upgrade(raw: dict) -> dict:
+    """旧版保存的配置升级到当前格式（读取时执行，下次保存时落盘）：
+    - 按级别发邮件（email_min_severity）→ 按事件勾选（email_events）；当时默认的每小时 12 封降为 6 封；
+    - 去掉已不存在的风控参数（例如 urgent_repeat_minutes，改为“同一事件当天只发一次”）。"""
+    n = raw.get("notify")
+    if isinstance(n, dict) and "email_events" not in n:
+        n["email_events"] = events_for_severity(n.get("email_min_severity", "warn"))
+        if n.get("email_max_per_hour") == 12:
+            n["email_max_per_hour"] = 6
+    if isinstance(n, dict):
+        n.pop("email_min_severity", None)
+    if isinstance(raw.get("rules"), dict):
+        raw["rules"] = {k: v for k, v in raw["rules"].items() if k in RULE_KEYS}
+    if isinstance(raw.get("leader_rules"), dict):
+        raw["leader_rules"] = {pid: {k: v for k, v in (r or {}).items() if k in RULE_KEYS}
+                               for pid, r in raw["leader_rules"].items()}
+    return raw
+
+
 class SettingsError(ValueError):
     """校验失败，message 直接展示给用户。"""
 
@@ -128,8 +150,13 @@ def validate(cfg: dict) -> dict:
             raise SettingsError(msg)
     r["loss_tiers"] = sorted(float(t) for t in r["loss_tiers"])
     n = cfg["notify"]
-    if n["email_min_severity"] not in ("info", "warn", "urgent"):
-        raise SettingsError("邮件级别只能是 info / warn / urgent")
+    events = n.get("email_events")
+    if not isinstance(events, list) or any(e not in EVENT_KEYS for e in events):
+        raise SettingsError("发邮件的事件不合法")
+    n["email_events"] = [k for k in EVENT_KEYS if k in events]  # 去重、固定顺序
+    n["email_batch_minutes"] = int(float(n["email_batch_minutes"]))
+    if not 0 <= n["email_batch_minutes"] <= 240:
+        raise SettingsError("汇总间隔应在 0–240 分钟之间")
     n["smtp_port"] = int(n["smtp_port"])
     n["email_max_per_hour"] = int(n["email_max_per_hour"])
     if not 1 <= n["email_max_per_hour"] <= 120:
@@ -169,7 +196,7 @@ class Settings:
     def get(self) -> dict:
         with self._db() as db:
             row = db.execute("SELECT value FROM settings WHERE key='app'").fetchone()
-        return _deep_merge(DEFAULTS, json.loads(row[0]) if row else {})
+        return _deep_merge(DEFAULTS, upgrade(json.loads(row[0])) if row else {})
 
     def version(self) -> float:
         with self._db() as db:
@@ -276,6 +303,7 @@ class Settings:
         if app_cfg is not None:
             rc = asdict(app_cfg.rules)
             rc["loss_tiers"] = list(rc["loss_tiers"])
+            rc["tp_ladder"] = [list(x) for x in rc["tp_ladder"]]
             if rc != _rule_defaults_from_ruleconfig():
                 cfg["rules"].update(rc)
                 cfg["preset"] = "custom"
@@ -285,7 +313,7 @@ class Settings:
                     cfg["leader_rules"][lc.portfolio_id] = dict(lc.rules)
             cfg["monitor"]["poll_seconds"] = max(10.0, float(app_cfg.poll_seconds))
             cfg["monitor"]["loss_budget_u"] = float(app_cfg.loss_budget_u)
-            cfg["notify"]["email_min_severity"] = app_cfg.email_min_severity
+            cfg["notify"]["email_events"] = events_for_severity(app_cfg.email_min_severity)
             cfg["notify"]["email_max_per_hour"] = app_cfg.email_max_per_hour
         if env.get("SMTP_HOST") and env.get("SMTP_USER"):
             cfg["notify"].update(
@@ -310,6 +338,7 @@ class Settings:
 def _rule_defaults_from_ruleconfig() -> dict:
     d = asdict(RuleConfig())
     d["loss_tiers"] = list(d["loss_tiers"])
+    d["tp_ladder"] = [list(x) for x in d["tp_ladder"]]
     return d
 
 
@@ -334,4 +363,6 @@ def public_view(settings: Settings) -> dict:
         "smtp_pass_set": bool(s.get("smtp_pass")),
         "presets": PRESETS,
         "preset_names": PRESET_NAMES,
+        "email_event_groups": [{"key": k, "label": label, "default": d} for k, label, _, d in EVENT_GROUPS],
+        "email_event_presets": {"key": DEFAULT_EVENTS, "urgent": URGENT_EVENTS, "all": EVENT_KEYS},
     }

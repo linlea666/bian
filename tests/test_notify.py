@@ -34,7 +34,7 @@ def test_batch_into_one_mail_and_filter_info():
     assert body.index("消息0") < body.index("消息1")  # 紧急在前
     assert "消息2" not in body
     status = {it.row_id: (ok, err) for it, ok, err in res}
-    assert status[2] == (False, "email: 低于邮件通知级别，未发送")
+    assert status[2] == (False, "email: 按设置不发邮件（只在后台记录）")
     assert status[0][0] and status[1][0] and status[3][0]
 
 
@@ -141,3 +141,81 @@ def test_error_descriptions():
     assert "授权码" in describe_smtp_error(smtplib.SMTPAuthenticationError(535, b""))
     assert "SMTP_TO" in describe_smtp_error(smtplib.SMTPRecipientsRefused({}))
     assert "465" in describe_smtp_error(ssl.SSLError("x"))
+
+
+# ---------------------------------------------------------------- 按事件发邮件 + 定时汇总（M8）
+def ev(i, rule, sev="warn", created=0):
+    return Outgoing(i, f"消息{i}", sev, created=created, rule_id=rule)
+
+
+def test_event_filter_defaults():
+    rec = Recorder()
+    em = EmailNotifier(CFG, events=notify.DEFAULT_EVENTS, sender=rec)
+    res = em.deliver([ev(1, "L1"), ev(2, "R05"), ev(3, "R07"), ev(4, "R07L"), ev(5, "AUTH", "urgent"),
+                      ev(6, "A01b", "urgent"), ev(7, "R00", "info")], now=10)
+    sent = {it.row_id for it, ok, _ in res if ok}
+    assert sent == {1, 4, 5, 6}  # 浮盈回撤、普通加仓、开仓只在后台记录；凭证失效始终发
+    assert len(rec.mails) == 1
+
+
+def test_warn_waits_for_batch_and_urgent_flushes_everything():
+    rec = Recorder()
+    em = EmailNotifier(CFG, events=notify.DEFAULT_EVENTS, batch_minutes=60, sender=rec)
+    res = em.deliver([ev(1, "L1", created=0)], now=0)
+    assert rec.mails == [] and notify.is_soft(res[0][2]) and "等待合并" in res[0][2]
+    em.deliver([ev(2, "R12", created=600)], now=600)
+    assert rec.mails == []
+    res = em.deliver([], now=3600)  # 最早一条满 60 分钟：两条汇总成一封
+    assert len(rec.mails) == 1 and {it.row_id for it, ok, _ in res if ok} == {1, 2}
+    em.deliver([ev(3, "L2", created=3700)], now=3700)
+    res = em.deliver([ev(4, "R09", "urgent", created=3800)], now=3800)  # 紧急：立即发，捎上等待中的
+    assert len(rec.mails) == 2 and {it.row_id for it, ok, _ in res if ok} == {3, 4}
+    assert rec.mails[1][0].startswith("🚨")
+
+
+def test_requeue_after_restart():
+    rec = Recorder()
+    em = EmailNotifier(CFG, events=notify.DEFAULT_EVENTS, batch_minutes=60, sender=rec)
+    em.requeue([ev(9, "L1", created=0)])
+    res = em.deliver([], now=3601)
+    assert [it.row_id for it, ok, _ in res if ok] == [9]
+
+
+def test_event_group_and_severity_migration():
+    assert notify.event_group("L3") == "loss_tier" and notify.event_group("R07L") == "add_in_loss"
+    assert notify.event_group("XYZ") == "info"
+    assert notify.events_for_severity("urgent") == notify.URGENT_EVENTS
+    assert set(notify.events_for_severity("info")) == set(notify.EVENT_KEYS)
+
+
+def test_replay_screenshot_window_sends_at_most_three_mails():
+    """06:10–07:28 的真实场景：原来 10 封（加仓、浮盈回撤、权益回撤 3 次、强平 2 次……）。"""
+    from bian.models import Position
+    from bian.rules import AccountSnapshot, RuleConfig, evaluate, evaluate_account
+
+    cfg, t0 = RuleConfig(), 1_700_000_000.0
+    alerts = []  # (分钟, 规则, 级别)
+
+    def acct(eq):
+        return AccountSnapshot("L", "BTC杰师傅", eq, 300, 0, 0, False, 0, 0, "")
+    st, _ = evaluate_account(acct(300), None, cfg, t0)
+    for minute, eq in ((17, 236), (47, 224), (77, 238)):  # 21.4% / 25.4% / 20.8%
+        st, al = evaluate_account(acct(eq), st, cfg, t0 + minute * 60)
+        alerts += [(minute, a.rule_id, a.severity) for a in al if a.rule_id != "A02"]
+    liq = Position("L", "ETHUSDT", "SHORT", 1, 2000, 1905, 20, 95, "copy", liquidation_price=2000)
+    ps, _ = evaluate(liq, None, cfg, t0 + 14 * 60)
+    ps.fired.clear()
+    for minute in (14, 59):  # 距强平 5.0% 两次
+        ps, al = evaluate(liq, ps, cfg, t0 + minute * 60)
+        alerts += [(minute, a.rule_id, a.severity) for a in al if a.rule_id == "R09"]
+    alerts += [(0, "R07", "warn"), (15, "R05", "warn"), (41, "R05", "warn"), (0, "R00", "info"), (78, "R07", "warn")]
+
+    rec = Recorder()
+    em = EmailNotifier(CFG, events=notify.DEFAULT_EVENTS, batch_minutes=60, sender=rec)
+    alerts.sort()
+    for i, (minute, rule, sev) in enumerate(alerts):
+        em.deliver([Outgoing(i, rule, sev, created=t0 + minute * 60, rule_id=rule)], now=t0 + minute * 60)
+    for minute in range(80, 200):
+        em.deliver([], now=t0 + minute * 60)
+    assert [r for _, r, _ in alerts].count("A01b") == 1 and [r for _, r, _ in alerts].count("R09") == 1
+    assert len(rec.mails) <= 3

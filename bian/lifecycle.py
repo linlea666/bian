@@ -185,9 +185,9 @@ class EpisodeRecorder:
             return
         self.store.db.execute(
             "INSERT INTO exits (episode_id, lead_id, leader_name, symbol, side, ts, qty, entry, price, partial, roi, "
-            "exit_type, remarks, status, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "exit_type, remarks, status, created, opened_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ep["id"], ep["leader_id"], ep["leader_name"], ep["symbol"], ep["side"], now, qty, ep.get("last_entry"),
-             mark, int(partial), roi, exit_type, "", "pending", created or now))
+             mark, int(partial), roi, exit_type, "", "pending", created or now, ep.get("opened_ts")))
 
     def close_leader(self, leader_id: str, leader_name: str, now: float | None = None) -> None:
         """跟单关系结束：该跟单下仍未结束的回合以“跟单结束”收尾。"""

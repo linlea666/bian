@@ -133,3 +133,63 @@ def test_match_and_slippage():
     assert e == pytest.approx(0.01) and x == pytest.approx(110 / 109 - 1)
     es, xs = slippage(cp("a", 0, 99, 111, "SHORT"), cp("b", 0, 100, 110, "SHORT"))
     assert es == pytest.approx(0.01) and xs == pytest.approx(-(110 / 111 - 1))
+
+
+# ---------------------------------------------------------------- 同一事件当天只发一次（M8 邮件降噪）
+def ids(al):
+    return [a.rule_id for a in al]
+
+
+def test_account_drawdown_once_per_day_unless_deeper_by_step():
+    """截图场景：回撤在 20%~25% 之间来回，原来每 30 分钟发一封；现在当天只在明显恶化时再发。"""
+    st, _ = evaluate_account(acct(300, stop_u=100, trigger=150), None, CFG, 0)
+    st, al = evaluate_account(acct(237, stop_u=100, trigger=150), st, CFG, 60)  # 回撤 21%
+    assert ids(al) == ["A01b"]
+    seq = [(232, []), (238, []), (240, []), (230, []), (236, [])]  # 20%~23.3%，30 分钟一次
+    t = 60
+    for eq, want in seq:
+        t += 1800
+        st, al = evaluate_account(acct(eq, stop_u=100, trigger=150), st, CFG, t)
+        assert ids(al) == want
+    st, al = evaluate_account(acct(222, stop_u=100, trigger=150), st, CFG, t + 60)  # 26%：比上次深 5 个点
+    assert ids(al) == ["A01b"]
+    st, al = evaluate_account(acct(222, stop_u=100, trigger=150), st, CFG, 86400 * 3)  # 第二天仍在回撤
+    assert ids(al) == ["A01b"]
+
+
+def test_account_drawdown_upgrade_from_warn_to_severe_same_day():
+    st, _ = evaluate_account(acct(300, stop_u=100, trigger=150), None, CFG, 0)
+    st, al = evaluate_account(acct(268, stop_u=100, trigger=150), st, CFG, 10)  # 10.7%
+    assert ids(al) == ["A01"]
+    st, al = evaluate_account(acct(239, stop_u=100, trigger=150), st, CFG, 20)  # 20.3%：进入紧急线
+    assert ids(al) == ["A01b"]
+
+
+def test_old_state_format_does_not_burst_after_upgrade():
+    """升级前保存的状态（30 分钟重复的旧格式）：升级后当天不会因为格式变化补发一遍。"""
+    st, _ = evaluate_account(acct(300, stop_u=100, trigger=150), None, CFG, 0)
+    st.fired = {"A01": {"version": st.version, "ts": 100, "armed": False, "ref": 0},
+                "A01b": {"version": st.version, "ts": 100, "armed": False, "ref": 0}}
+    st, al = evaluate_account(acct(237, stop_u=100, trigger=150), st, CFG, 200)
+    assert al == []
+
+
+def test_native_stop_near_once_per_day_unless_halved():
+    st, al = evaluate_account(acct(225, stop_u=100, trigger=201), None, CFG, 0)  # 剩 24U
+    assert "A03" in ids(al)
+    st, al = evaluate_account(acct(222, stop_u=100, trigger=201), st, CFG, 1800)  # 剩 21U
+    assert "A03" not in ids(al)
+    st, al = evaluate_account(acct(212, stop_u=100, trigger=201), st, CFG, 3600)  # 剩 11U：减半以内
+    assert "A03" in ids(al)
+
+
+def test_liquidation_once_per_day_unless_halved():
+    def lp(mark_ratio):  # 强平价固定 95，标记价变化
+        p = Position("L", "BTCUSDT", "LONG", 1, 100, 100 * mark_ratio, 10, 0, "copy", liquidation_price=95)
+        return p
+    st, al = evaluate(lp(0.999), None, CFG, 0)  # 距离 4.9%
+    assert "R09" in ids(al)
+    st, al = evaluate(lp(0.999), st, CFG, 2700)  # 45 分钟后仍是 4.9%（截图里第二封）
+    assert "R09" not in ids(al)
+    st, al = evaluate(lp(0.97), st, CFG, 2800)  # 2.1%：减半以内
+    assert "R09" in ids(al)

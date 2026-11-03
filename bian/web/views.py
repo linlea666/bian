@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 
 from ..lifecycle import episodes
+from ..notify import SOFT_MARKERS
 
 LEAD_URL = "https://www.binance.com/zh-CN/copy-trading/lead-details/{}"
 COPY_MGMT_URL = "https://www.binance.com/zh-CN/copy-trading"
@@ -117,11 +118,11 @@ def overview(store, settings, now: float | None = None) -> dict:
     positions, _ = store.get_runtime("positions", [])
     positions = positions or []
     smtp_ok = settings.smtp_config(cfg) is not None and cfg["notify"]["email_enabled"]
-    # 只把真正的发送错误算作失败：按级别有意不发、达到每小时上限稍后补发，都不是故障
+    # 只把真正的发送错误算作失败：按设置不发、等待合并、达到每小时上限稍后补发等，都不是故障
     last_mail_fail = store.db.execute(
         "SELECT ts, error FROM alerts WHERE error LIKE '%email:%' AND delivered = 0 AND ts > ? "
-        "AND error NOT LIKE '%低于邮件通知级别%' AND error NOT LIKE '%达到每小时上限%' ORDER BY id DESC LIMIT 1",
-        (now - 3600,)).fetchone()
+        + "".join(" AND error NOT LIKE ?" for _ in SOFT_MARKERS) + " ORDER BY id DESC LIMIT 1",
+        (now - 3600, *[f"%{m}%" for m in SOFT_MARKERS])).fetchone()
     rules = cfg["rules"]
     for a in accounts:
         a["light"] = light_for_account(a, rules, positions)

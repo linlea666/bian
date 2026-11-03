@@ -28,15 +28,17 @@ class RuleConfig:
     trail_gap_roi: float = 0.15  # R05 从最高浮盈回撤多少个 ROI 点提醒
     liq_distance_pct: float = 0.05  # R09 标记价距强平价 ≤5% 紧急提醒
     rearm_gap: float = 0.05  # 回升超过阈值 + 该值后重新武装提醒（防抖）
-    urgent_repeat_minutes: float = 30  # 紧急状态持续时的重复提醒间隔
     add_threshold: float = 0.01  # 数量变化超过 1% 视为加/减仓
     min_alert_u: float = 2.0  # 我的盈亏金额（U）低于该值时，ROI 类提醒不发（避免小仓位刷屏）
     liq_sanity_pct: float = 0.5  # 强平价距标记价超过 50% 视为无效数据
     # ---- 跟单账户级（每个跟单关系）
     account_dd_warn: float = 0.10  # 跟单权益从最高点回撤 10% 提醒
     account_dd_severe: float = 0.20  # 回撤 20% 紧急提醒
+    account_dd_step: float = 0.05  # 当天已提醒过：回撤再加深 5 个点才再提醒
     recommend_total_stop_pct: float = 0.20  # 未设原生总止损时，建议的止损额 = 净投入 × 该比例
     native_stop_near_pct: float = 0.30  # 距原生总止损触发只剩止损额的 30% 时提醒
+    # ---- 分批止盈阶梯（R13，第三期）：((浮盈 ROI, 平仓比例), ...)；空 = 不提醒。一般在领航员页“采用”推荐后按领航员设置
+    tp_ladder: tuple = ()
 
     def merged(self, overrides: dict | None) -> "RuleConfig":
         if not overrides:
@@ -51,6 +53,12 @@ class RuleConfig:
                 if not tiers:
                     raise ValueError("loss_tiers 至少需要一个正数档位")
                 out[f.name] = tiers
+            elif f.name == "tp_ladder":
+                levels = tuple(sorted((float(a), float(b)) for a, b in (v or [])))
+                if len(levels) > 5 or any(not (0 < a <= 20 and 0 < b <= 1) for a, b in levels) \
+                        or sum(b for _, b in levels) > 1.0001:
+                    raise ValueError("止盈阶梯：每级浮盈 0–2000%、比例 0–100%，合计不超过 100%，最多 5 级")
+                out[f.name] = levels
             elif f.name == "loss_tiers_mode":
                 if v not in ("roi", "price"):
                     raise ValueError("loss_tiers_mode 只能是 roi 或 price")
@@ -126,6 +134,28 @@ def _mark(st: PosState, rule: str, now: float, ref: float = 0.0) -> None:
     st.fired[rule] = {"version": st.version, "ts": now, "armed": False, "ref": ref}
 
 
+def _fired_today(st: PosState, rule: str, now: float) -> dict | None:
+    """同一版本的该事件今天是否已经通知过（旧状态没有 day 字段时按通知时间推算）。"""
+    f = st.fired.get(rule)
+    if f and f.get("version") == st.version and f.get("day", _day(f.get("ts", 0))) == _day(now):
+        return f
+    return None
+
+
+def _daily(st: PosState, rule: str, now: float, worse=None) -> bool:
+    """同一事件当天只通知一次（第二天状况仍在时再通知一次）；
+    worse(上次通知时的程度) 为真 = 明显恶化，当天也立即再通知。"""
+    f = _fired_today(st, rule, now)
+    if f is None:
+        return True
+    level = f.get("level")
+    return bool(worse and level is not None and worse(level))
+
+
+def _note(st: PosState, rule: str, now: float, level: float | None = None, **extra) -> None:
+    st.fired[rule] = {"version": st.version, "ts": now, "day": _day(now), "level": level, "armed": False, **extra}
+
+
 def _rearm(st: PosState, rule: str) -> None:
     f = st.fired.get(rule)
     if f and f.get("version") == st.version:
@@ -161,7 +191,13 @@ def evaluate(
         if st.stage != "UNPROTECTED" and roi < cfg.breakeven_trigger_roi:
             st.stage = "UNPROTECTED"
         change = f"数量 {st.qty:g} → {pos.qty:g}，均价 {_px(st.entry_price)} → {_px(pos.entry_price)}"
-        if increased:
+        first_tier = cfg.tier_rois(pos.leverage)[0]
+        if increased and -roi >= first_tier and big(roi) and st.loss.get("add_loss_day") != _day(now):
+            # 亏损已经到第 1 档还在加仓 = 摊平扛单，单独提醒（每个仓位每天一次）
+            st.loss["add_loss_day"] = _day(now)
+            add("R07L", "warn", f"亏损中还在加仓（摊平扛单）：ROI {_fmt_pct(roi)}{u(roi)}", change,
+                "领航员在亏损超过第 1 档后继续加仓，风险敞口在扩大：考虑在币安设置止损或减仓，不要跟着越扛越大")
+        elif increased:
             add("R07", "warn", "领航员加仓（风险敞口扩大）", change,
                 "加仓后均价改变：请检查币安止损/止盈是否仍覆盖整个仓位（跟单的 TP/SL 只对设置时的新仓有效）")
         else:
@@ -172,21 +208,17 @@ def evaluate(
     st.last_roi = roi
     st.peak_roi = max(st.peak_roi, roi)
     st.trough_roi = min(st.trough_roi, roi)
-    repeat_s = cfg.urgent_repeat_minutes * 60
-
     alerts += _loss_tiers(pos, st, cfg, now, margin_u)
 
     # ---- R09 接近强平
     if pos.liquidation_valid(cfg.liq_sanity_pct):
         dist = abs(pos.mark_price - pos.liquidation_price) / pos.mark_price
-        if dist <= cfg.liq_distance_pct:
-            if _can_fire(st, "R09", now, repeat_s):
-                add("R09", "urgent", f"距强平价仅 {dist * 100:.1f}%",
-                    f"现价 {_px(pos.mark_price)}，强平价 {_px(pos.liquidation_price)}",
-                    "止损可能来不及：考虑立即减仓/平仓或追加保证金")
-                _mark(st, "R09", now)
-        elif dist > cfg.liq_distance_pct * 1.5:
-            _rearm(st, "R09")
+        # 当天只提醒一次；距离又缩小到上次的一半以内 = 明显恶化，立即再提醒
+        if dist <= cfg.liq_distance_pct and _daily(st, "R09", now, lambda prev: dist <= prev / 2):
+            add("R09", "urgent", f"距强平价仅 {dist * 100:.1f}%",
+                f"现价 {_px(pos.mark_price)}，强平价 {_px(pos.liquidation_price)}",
+                "止损可能来不及：考虑立即减仓/平仓或追加保证金")
+            _note(st, "R09", now, dist)
 
     # ---- R04 浮盈达门槛 → 建议保本
     if pos.is_hedge:
@@ -215,9 +247,22 @@ def evaluate(
                 f"考虑部分止盈，或把止损提到约 {_px(pos.price_at_roi(roi - cfg.trail_gap_roi / 2))}")
             _mark(st, "R05", now, ref=st.peak_roi)
 
+    # ---- R13 分批止盈阶梯：浮盈到达某一级时提醒止盈相应比例（每级每个仓位版本只提醒一次）
+    if cfg.tp_ladder and big(roi):
+        f = st.fired.get("R13")
+        done = f.get("levels", []) if f and f.get("version") == st.version else []
+        hit = [i for i, (lv, _) in enumerate(cfg.tp_ladder) if roi >= lv and i not in done]
+        if hit:
+            i = max(hit)  # 一次越过多级只提醒最高的一级
+            lv, frac = cfg.tp_ladder[i]
+            add("R13", "warn", f"浮盈 {_fmt_pct(roi)}{u(roi)} 到达止盈第 {i + 1}/{len(cfg.tp_ladder)} 级"
+                f"（+{lv * 100:.0f}%）：建议先止盈约 {frac:.0%}", "",
+                f"按这个领航员的风格（赚了也常不分批止盈），在币安该跟单仓位手动平掉约 {frac:.0%}，剩下的继续跟随")
+            st.fired["R13"] = {"version": st.version, "ts": now, "levels": sorted(set(done) | set(range(i + 1)))}
+
     # ---- R10 盈转亏：曾达到保本门槛，现已跌回保本线以下
     if st.stage in ("BREAKEVEN_SUGGESTED", "TRAILING") and roi <= cfg.breakeven_lock_roi and big(st.peak_roi):
-        if _can_fire(st, "R10", now):
+        if _can_fire(st, "R10", now) and _fired_today(st, "R10", now) is None:  # 回升后再跌回：当天不重复
             add("R10", "urgent", f"盈利单回到保本线以下（最高 {_fmt_pct(st.peak_roi)} → {_fmt_pct(roi)}）",
                 "", "若尚未设置保本止损，现在处理，避免盈利单变成亏损单")
             _mark(st, "R10", now)
@@ -231,17 +276,21 @@ def evaluate(
 class PortfolioState:
     fired: bool = False
     last_ts: float = 0.0
+    day: str = ""  # 当天已提醒过的日期
+    level: float = 0.0  # 上次提醒时的浮亏（U，正数）
 
 
 def evaluate_portfolio(
-    est_pnl_u: float, budget_u: float, st: PortfolioState, now: float, repeat_s: float = 1800
+    est_pnl_u: float, budget_u: float, st: PortfolioState, now: float
 ) -> tuple[PortfolioState, Alert | None]:
-    """R06 组合浮亏预算。est_pnl_u 为所有仓位的预估浮动盈亏（U，亏损为负）。"""
+    """R06 组合浮亏预算。est_pnl_u 为所有仓位的预估浮动盈亏（U，亏损为负）。
+    当天只提醒一次；浮亏比上次提醒时再扩大 25% 以上 = 明显恶化，立即再提醒。"""
     if budget_u <= 0:
         return st, None
     if est_pnl_u <= -budget_u:
-        if not st.fired or now - st.last_ts >= repeat_s:
-            st.fired, st.last_ts = True, now
+        loss = -est_pnl_u
+        if st.day != _day(now) or loss >= st.level * 1.25:
+            st.fired, st.last_ts, st.day, st.level = True, now, _day(now), loss
             return st, Alert("R06", "urgent", "portfolio", 0,
                              f"组合预估浮亏 {est_pnl_u:.2f}U 超过预算 {budget_u:.0f}U",
                              suggestion="考虑在币安暂停跟单（停止开新仓）并减仓亏损最大的仓位")
@@ -325,7 +374,6 @@ def evaluate_account(
         st.version += 1
     st.peak_equity = max(st.peak_equity, a.equity)
     st.last_equity = a.equity
-    repeat_s = cfg.urgent_repeat_minutes * 60
 
     def add(rule, sev, title, detail="", suggestion=""):
         alerts.append(Alert(rule, sev, key, st.version, title, detail, suggestion, now))
@@ -337,18 +385,17 @@ def evaluate_account(
     loss_u = a.equity - a.invested
     detail = (f"跟单权益 {a.equity:.2f}U（最高 {st.peak_equity:.2f}U，净投入 {a.invested:.2f}U，"
               f"相对净投入 {loss_u:+.2f}U）")
-    emitted = False
-    for rule, thr, sev, rep in (("A01b", cfg.account_dd_severe, "urgent", repeat_s),
-                                ("A01", cfg.account_dd_warn, "warn", None)):
-        if dd >= thr and (st.peak_equity - a.equity) >= cfg.min_alert_u:
-            if _can_fire(shim, rule, now, rep):
-                if not emitted:
-                    add(rule, sev, f"跟单权益从最高点回撤 {dd * 100:.1f}%（{a.equity - st.peak_equity:+.2f}U）", detail,
-                        "考虑在币安暂停该跟单（不再开新仓）或减仓；若未设置跟单总止损，现在设置")
-                    emitted = True
-                _mark(shim, rule, now)
-        elif dd < thr - 0.03:
-            _rearm(shim, rule)
+    # 当天只提醒一次；回撤再加深 account_dd_step，或从提醒线进入紧急线 = 明显恶化，立即再提醒
+    if dd >= cfg.account_dd_warn and (st.peak_equity - a.equity) >= cfg.min_alert_u:
+        severe = dd >= cfg.account_dd_severe
+        today = _fired_today(shim, "A01", now)
+        prev_sev = (today or {}).get("sev") or ("urgent" if _fired_today(shim, "A01b", now) else "warn")
+        upgrade = severe and today is not None and prev_sev != "urgent"
+        if upgrade or _daily(shim, "A01", now, lambda prev: dd >= prev + cfg.account_dd_step):
+            add("A01b" if severe else "A01", "urgent" if severe else "warn",
+                f"跟单权益从最高点回撤 {dd * 100:.1f}%（{a.equity - st.peak_equity:+.2f}U）", detail,
+                "考虑在币安暂停该跟单（不再开新仓）或减仓；若未设置跟单总止损，现在设置")
+            _note(shim, "A01", now, dd, sev="urgent" if severe else "warn")
 
     if not a.has_native_stop:
         rec = recommended_stop_u or round(a.invested * cfg.recommend_total_stop_pct, 2)
@@ -359,15 +406,14 @@ def evaluate_account(
             _mark(shim, "A02", now)
     else:
         room = a.equity - a.native_stop_trigger_equity
-        if room <= a.native_stop_u * cfg.native_stop_near_pct:
-            if _can_fire(shim, "A03", now, repeat_s):
-                add("A03", "urgent", f"距跟单总止损触发只剩 {room:.2f}U",
-                    f"{detail}；总止损 {a.native_stop_u:.0f}U，触发权益约 {a.native_stop_trigger_equity:.2f}U，"
-                    f"触发后处理方式 {a.disposal}",
-                    "交易所会按设置自动处理；如不希望全部平仓，请提前手动减仓")
-                _mark(shim, "A03", now)
-        elif room > a.native_stop_u * cfg.native_stop_near_pct * 1.5:
-            _rearm(shim, "A03")
+        # 当天只提醒一次；剩余空间又缩小到上次的一半以内 = 明显恶化，立即再提醒
+        if room <= a.native_stop_u * cfg.native_stop_near_pct and \
+                _daily(shim, "A03", now, lambda prev: room <= prev / 2):
+            add("A03", "urgent", f"距跟单总止损触发只剩 {room:.2f}U",
+                f"{detail}；总止损 {a.native_stop_u:.0f}U，触发权益约 {a.native_stop_trigger_equity:.2f}U，"
+                f"触发后处理方式 {a.disposal}",
+                "交易所会按设置自动处理；如不希望全部平仓，请提前手动减仓")
+            _note(shim, "A03", now, room)
 
     if a.is_paused and _can_fire(shim, "A04", now, 24 * 3600):
         add("A04", "info", "该跟单处于暂停状态（不会跟新仓，已有仓位仍在）")
@@ -409,7 +455,7 @@ def _loss_tiers(pos: Position, st: PosState, cfg: RuleConfig, now: float, margin
         return []  # 金额太小，不发也不标记
 
     if ls.get("day") != _day(now):
-        ls["day"], ls["day_count"] = _day(now), 0
+        ls["day"], ls["day_count"], ls["day_top"] = _day(now), 0, -1
     top_fired = max(ls["fired"], default=-1)
     escalation = top_fired >= 0 and reached > top_fired
     fresh = top_fired < 0
@@ -417,6 +463,8 @@ def _loss_tiers(pos: Position, st: PosState, cfg: RuleConfig, now: float, margin
               and now - ls.get("top_ts", 0) >= cfg.loss_top_tier_repeat_hours * 3600)
     if not (escalation or fresh or repeat):
         return []
+    if reached <= ls.get("day_top", -1) and not repeat:
+        return []  # 回升后又跌回今天已提醒过的档位：当天不重复（跌到更高档仍立即提醒）
     last = ls.get("last_ts") or None  # 从未通知过：不受冷却限制
     if not escalation and last is not None and now - last < cfg.loss_cooldown_minutes * 60:
         return []
@@ -429,6 +477,7 @@ def _loss_tiers(pos: Position, st: PosState, cfg: RuleConfig, now: float, margin
     ls["fired"].sort()
     ls["last_ts"] = now
     ls["day_count"] = ls.get("day_count", 0) + 1
+    ls["day_top"] = max(ls.get("day_top", -1), reached)
     if reached == len(rois) - 1:
         ls["top_ts"] = now
 

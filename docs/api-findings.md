@@ -6,7 +6,7 @@
 
 | 数据 | 接口（均为 `https://www.binance.com` 下） | 结果 | 关键字段 |
 |---|---|---|---|
-| 领航员榜单 | POST `/bapi/futures/v1/friendly/future/copy-trade/home-page/query-list` | ✅ 约 9170 位 | leadPortfolioId, nickname, roi, pnl, mdd, winRate, aum, copierPnl, currentCopyCount |
+| 领航员榜单 | POST `/bapi/futures/v1/friendly/future/copy-trade/home-page/query-list` | ✅ 约 9170 位 | leadPortfolioId, nickname, roi, pnl, mdd, winRate, aum, copierPnl, currentCopyCount（roi / mdd / winRate 都是百分数；每页最多 30 条；`nickname` 可按昵称查单个领航员——详情接口没有 mdd，推荐总止损时用这个查近 90 天最大回撤） |
 | 领航员详情 | GET `/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/detail?portfolioId=` | ✅ | marginBalance, aumAmount, copierPnl, profitSharingRate, **positionShow**；copyPortfolioId 不带登录为 null |
 | 已平仓历史 | POST `.../lead-portfolio/position-history` `{pageNumber,pageSize≤100,portfolioId}` | ✅ 全量可翻页 | opened, closed, avgCost, avgClosePrice, maxOpenInterest, closedVolume, leverage, closingPnl, roi, side, isolated, status |
 | 当前持仓 | GET `.../lead-data/positions?portfolioId=` | ⚠️ 只有 positionShow=true 的领航员有数据（AUM 前 40 名里 6 位） | symbol, positionAmount（BOTH 模式负数=空）, entryPrice, markPrice, unrealizedProfit, leverage, breakEvenPrice, notionalValue；返回全部合约，需过滤数量≠0 |

@@ -25,11 +25,21 @@ def test_ac04_tier_once_then_escalate_once():
     assert out == [["R00"], [], ["L1"], [], [], ["L2"], []]
 
 
-def test_tier_rearms_after_clear_recovery_and_respects_cooldown():
+def test_tier_rearms_after_clear_recovery_but_not_twice_same_day():
     cfg = RuleConfig(loss_tiers=(20,), loss_cooldown_minutes=1)
-    # 回升到 -10% 以上（20 - min(10, 10) = 10）才重新武装；冷却 60 秒
+    # 回升到 -10% 以上（20 - min(10, 10) = 10）才重新武装；但同一档当天只提醒一次
     _, out = run([pos(-0.21), pos(-0.12), pos(-0.21), pos(-0.09), pos(-0.21), pos(-0.21)], cfg, step=20)
-    assert out == [["R00", "L1"], [], [], [], ["L1"], []]
+    assert out == [["R00", "L1"], [], [], [], [], []]
+    # 第二天：回升后再跌回该档，重新提醒
+    st, out = run([pos(-0.21), pos(-0.09)], cfg, step=20)
+    st, a = evaluate(pos(-0.21), st, cfg, 86400 * 2)
+    assert [x.rule_id for x in a] == ["L1"]
+
+
+def test_same_day_recovery_then_deeper_tier_still_escalates():
+    cfg = RuleConfig(loss_tiers=(20, 40), loss_cooldown_minutes=0)
+    _, out = run([pos(-0.21), pos(-0.05), pos(-0.21), pos(-0.45)], cfg)
+    assert out == [["R00", "L1"], [], [], ["L2"]]
 
 
 def test_escalation_skips_cooldown_and_jump_sends_highest_only():
@@ -54,8 +64,16 @@ def test_add_position_does_not_reset_loss_tiers():
     cfg = RuleConfig(loss_tiers=(20,))
     st, out = run([pos(-0.21), pos(-0.21, qty=2.0, entry=95), pos(-0.22, qty=2.0, entry=95)], cfg)
     assert out[0] == ["R00", "L1"]
-    assert out[1] == ["R07"]  # 只有加仓提醒，不重复亏损通知
+    assert out[1] == ["R07L"]  # 亏损超过第 1 档还加仓：摊平扛单提醒，不重复亏损通知
     assert st.version == 2 and out[2] == []
+
+
+def test_add_in_loss_once_per_day_and_normal_add():
+    cfg = RuleConfig(loss_tiers=(20,))
+    _, out = run([pos(-0.21), pos(-0.21, qty=2.0), pos(-0.21, qty=3.0), pos(-0.21, qty=4.0)], cfg)
+    assert out[1] == ["R07L"] and out[2] == ["R07"] and out[3] == ["R07"]  # 当天第二次起按普通加仓
+    _, out = run([pos(0.05), pos(0.05, qty=2.0)], cfg)
+    assert out[1] == ["R07"]  # 没亏损的加仓：普通加仓（默认不发邮件）
 
 
 def test_price_mode_scales_with_leverage():
@@ -103,10 +121,14 @@ def test_portfolio_budget():
     st, a = evaluate_portfolio(-120, 100, st, 10)
     assert a and a.rule_id == "R06"
     st, a = evaluate_portfolio(-130, 100, st, 20)
-    assert a is None  # 冷却中
-    st, a = evaluate_portfolio(-50, 100, st, 30)  # 恢复到 80% 以内重新武装
+    assert a is None  # 当天已提醒，没有明显恶化
+    st, a = evaluate_portfolio(-50, 100, st, 30)
     st, a = evaluate_portfolio(-110, 100, st, 40)
-    assert a is not None
+    assert a is None  # 回升后又跌回：当天不重复
+    st, a = evaluate_portfolio(-151, 100, st, 50)
+    assert a is not None  # 比上次（120U）扩大 25% 以上：立即再提醒
+    st, a = evaluate_portfolio(-151, 100, st, 86400 * 2)
+    assert a is not None  # 第二天状况仍在：再提醒一次
 
 
 def test_rule_overrides():

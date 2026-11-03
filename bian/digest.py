@@ -4,7 +4,19 @@ from __future__ import annotations
 import time
 
 from . import exits, stats
+from .notify import EVENT_GROUPS, SKIPPED, event_group
 from .web import views
+
+
+def _recorded_only(store, start: float, end: float) -> list[tuple[str, int]]:
+    """按设置不发邮件、只在后台记录的提醒，按事件分组计数（每日摘要里提一句，避免漏看）。"""
+    names = {k: label for k, label, _, _ in EVENT_GROUPS}
+    counts: dict[str, int] = {}
+    for (rule_id,) in store.db.execute("SELECT rule_id FROM alerts WHERE ts >= ? AND ts < ? AND error LIKE ?",
+                                       (start, end, f"%{SKIPPED}%")):
+        g = names.get(event_group(rule_id or ""), "其他")
+        counts[g] = counts.get(g, 0) + 1
+    return sorted(counts.items(), key=lambda x: -x[1])
 
 
 def build(store, settings, now: float | None = None) -> tuple[str, str]:
@@ -41,6 +53,11 @@ def build(store, settings, now: float | None = None) -> tuple[str, str]:
                      f"避免回吐 {ex['avoid_giveback_n']} 次，少赚 {ex['missed_n']} 次；净效果 {ex['net_u']:+.2f}U")
         if ex["waiting"]:
             lines.append(f"另有 {ex['waiting']} 笔提前离场在等领航员平仓后结算")
+        lines.append("")
+    quiet = _recorded_only(store, y_start, y_end)
+    if quiet:
+        lines.append("昨日只在后台记录、没有发邮件的提醒：" + "，".join(f"{k} {n} 条" for k, n in quiet)
+                     + "（可在后台“记录 → 提醒记录”查看；在“设置 → 邮件提醒”里可以改成发邮件）")
         lines.append("")
     positions, _ = store.get_runtime("positions", [])
     mine = sorted((p for p in positions or [] if p.get("source") == "copy"), key=lambda p: p.get("unrealized_pnl") or 0)[:3]

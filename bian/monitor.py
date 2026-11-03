@@ -9,7 +9,8 @@ from .client import AuthExpired, BinanceError, Client, RateLimited
 from .config import AppConfig, LeaderConfig
 from .exposure import describe_legs, net_by_symbol
 from .models import Position
-from .notify import Notifier, Outgoing, deliver_all
+from .notify import Notifier, Outgoing, deliver_all, is_soft
+from .sync import mark_copy_set
 from .rules import (
     AccountSnapshot, AccountState, Alert, PortfolioState, PosState, RuleConfig,
     evaluate, evaluate_account, evaluate_portfolio,
@@ -223,10 +224,19 @@ class Monitor:
         return out
 
     def _sync_relations(self, rels: list[dict], now: float) -> None:
-        """运行中发现新跟单 / 结束跟单：自动加入或移除监控（只针对自动发现的领航员）。"""
-        if not self.cfg.auto_discover:
-            return
+        """运行中发现新跟单 / 结束跟单：自动加入或移除监控（只针对自动发现的领航员）；
+        并更新领航员的“跟单中 / 已停止跟单”状态（停止后数据默认保留，可在领航员页导出或删除）。"""
         live = {str(r.get("leadPortfolioId")): r for r in rels}
+        ended = set(mark_copy_set(self.store, live, now))
+        removed = self._discover(live, now) if self.cfg.auto_discover else set()
+        for pid in sorted(ended - removed):  # 例如服务停机期间停止的跟单（监控里已经没有它）
+            row = self.store.db.execute("SELECT name FROM leaders WHERE lead_id=?", (pid,)).fetchone()
+            self.store.log_event("leader.ended", f"已停止跟单：{(row and row[0]) or pid}（数据继续保留，"
+                                 "可在领航员页导出或删除）", leader_id=pid, ts=now)
+
+    def _discover(self, live: dict, now: float) -> set:
+        """自动加入新跟单、移除已结束的跟单。返回本次移除的领航员 ID。"""
+        removed = set()
         configured = {lc.portfolio_id for lc in self.cfg.leaders}
         for pid, r in live.items():
             if any(lr.cfg.portfolio_id == pid for lr in self.leaders):
@@ -243,7 +253,10 @@ class Monitor:
                 self.leaders.remove(lr)
                 if self.recorder:
                     self.recorder.close_leader(pid, lr.name, now)
-                self.store.log_event("leader.removed", f"跟单已结束：{lr.name}，停止监控", leader_id=pid, ts=now)
+                self.store.log_event("leader.removed", f"跟单已结束：{lr.name}，停止监控（数据继续保留，可在领航员页导出或删除）",
+                                     leader_id=pid, ts=now)
+                removed.add(pid)
+        return removed
 
     def _process(self, lr: LeaderRuntime, positions: list[Position], now: float) -> list[Alert]:
         out: list[Alert] = []
@@ -430,7 +443,7 @@ class Monitor:
         """写入审计表并放进发件箱；本轮结束时由 flush() 统一投递（邮件会合并成一封）。"""
         msg = self.format(a, lr, pos)
         row_id = self.store.add_alert(a, msg, False, "待发送")
-        self.outbox.append(Outgoing(row_id, msg, a.severity, a.ts or self.clock()))
+        self.outbox.append(Outgoing(row_id, msg, a.severity, a.ts or self.clock(), a.rule_id))
         leader_id = lr.cfg.portfolio_id if lr else None
         ep_ids = []
         if self.recorder and lr and pos:
@@ -448,7 +461,7 @@ class Monitor:
         items, self.outbox = self.outbox, []
         for it, ok, err in deliver_all(self.notifier, items, now if now is not None else self.clock()):
             self.store.update_delivery(it.row_id, ok, err)
-            if not ok and "低于邮件通知级别" not in err:
+            if not ok and not is_soft(err):  # 有意不发 / 等待合并不是故障
                 print(f"通知未送达（已记录，可能稍后重试）：{err}")
                 self.store.log_event("notify.failed", f"提醒未送达：{err[:120]}", "warn", ref=f"alert:{it.row_id}")
 

@@ -2,7 +2,8 @@
 
 投递模型：监控每轮把提醒放进发件箱，轮次结束时统一 deliver()。
 - 控制台 / Telegram：逐条发送。
-- 邮件：同一轮的多条提醒合并成一封；按级别过滤；每小时封数上限；失败 5 分钟后重试。
+- 邮件：只发设置里勾选的事件（email_events）；紧急的立即发，并捎上等待中的提醒；
+  非紧急的攒满 batch_minutes 后汇总成一封；每小时封数上限；失败 5 分钟后重试。
 每条提醒的投递结果都如实返回（不把“已提交/排队中”当成“已送达”）。
 """
 from __future__ import annotations
@@ -23,12 +24,61 @@ ICON = {"info": "ℹ️", "warn": "⚠️", "urgent": "🚨"}
 LEVEL = {"info": 0, "warn": 1, "urgent": 2}
 
 
+# 邮件事件分组：(键, 名称, 规则 ID, 默认是否发邮件)。L1/L2/... 亏损分档统一归入 loss_tier。
+EVENT_GROUPS: list[tuple[str, str, tuple[str, ...], bool]] = [
+    ("loss_tier", "仓位亏损到档位", ("L*",), True),
+    ("account_dd", "跟单权益回撤", ("A01", "A01b"), True),
+    ("liquidation", "接近强平", ("R09",), True),
+    ("profit_to_loss", "盈利单跌回保本以下", ("R10",), True),
+    ("native_stop", "接近跟单总止损", ("A03",), True),
+    ("portfolio", "组合浮亏超预算", ("R06",), True),
+    ("residual", "残留仓位（领航员已平、你还在）", ("R12",), True),
+    ("add_in_loss", "亏损中还在加仓（摊平扛单）", ("R07L",), True),
+    ("system", "无法监控 / 数据中断", ("R08",), True),
+    ("trail", "浮盈回撤", ("R05",), False),
+    ("add", "领航员加仓", ("R07",), False),
+    ("tp_ladder", "分批止盈到位", ("R13",), False),
+    ("breakeven", "浮盈达标建议保本", ("R04",), False),
+    ("info", "开仓 / 减仓 / 未设总止损 / 暂停等信息", ("R00", "R07b", "A02", "A04"), False),
+]
+EVENT_KEYS = [g[0] for g in EVENT_GROUPS]
+DEFAULT_EVENTS = [g[0] for g in EVENT_GROUPS if g[3]]
+URGENT_EVENTS = ["loss_tier", "account_dd", "liquidation", "profit_to_loss", "native_stop", "portfolio"]
+ALWAYS_EMAIL = ("AUTH",)  # 凭证失效：始终发，不可关闭
+
+
+def event_group(rule_id: str) -> str:
+    if len(rule_id) >= 2 and rule_id[0] == "L" and rule_id[1:].isdigit():
+        return "loss_tier"
+    for key, _, ids, _ in EVENT_GROUPS:
+        if rule_id in ids:
+            return key
+    return "info"
+
+
+def events_for_severity(min_severity: str) -> list[str]:
+    """旧版“按级别发邮件”的设置换算成事件清单（升级迁移用）。"""
+    return {"urgent": list(URGENT_EVENTS), "info": list(EVENT_KEYS)}.get(min_severity, list(DEFAULT_EVENTS))
+
+
+# 投递说明里的“非故障”状态：有意不发 / 排队等待，不算发送失败（作战室邮件状态、未送达日志都据此判断）
+SKIPPED = "按设置不发邮件（只在后台记录）"
+HELD = "等待合并"
+SOFT_MARKERS = (SKIPPED, HELD, "达到每小时上限", "上次发送失败，等待重试", "服务重启",
+                "低于邮件通知级别")  # 最后一个是旧版文案，兼容历史记录
+
+
+def is_soft(err: str) -> bool:
+    return any(m in (err or "") for m in SOFT_MARKERS)
+
+
 @dataclass
 class Outgoing:
     row_id: int  # alerts 表的行 ID，用于回写投递结果
     text: str
     severity: str = "info"
     created: float = field(default_factory=time.time)
+    rule_id: str = ""  # 决定是否发邮件（按事件分组）
 
 
 Result = tuple[Outgoing, bool, str]  # (提醒, 是否送达, 说明/错误)
@@ -179,19 +229,36 @@ def describe_smtp_error(e: Exception) -> str:
 
 
 class EmailNotifier(Notifier):
-    """合并发送 + 级别过滤 + 每小时上限 + 失败重试。"""
+    """事件过滤 + 合并发送 + 每小时上限 + 失败重试。
+
+    events：发邮件的事件分组（None 表示按 min_severity 级别过滤，命令行旧配置用）。
+    batch_minutes：非紧急提醒攒多久汇总一封（0 = 每轮立即发）；有紧急提醒时立即发，并捎上等待中的。"""
 
     name = "email"
 
-    def __init__(self, cfg: SmtpConfig, min_severity: str = "warn", max_per_hour: int = 12,
-                 retry_seconds: float = 300, max_pending: int = 200, sender=smtp_send, clock=time.time):
+    def __init__(self, cfg: SmtpConfig, min_severity: str = "warn", max_per_hour: int = 6,
+                 retry_seconds: float = 300, max_pending: int = 200, sender=smtp_send, clock=time.time,
+                 events=None, batch_minutes: float = 0):
         self.cfg, self.min_level = cfg, LEVEL.get(min_severity, 1)
+        self.events = set(events) if events is not None else None
+        self.batch_s = max(0.0, float(batch_minutes)) * 60
         self.max_per_hour, self.retry_seconds, self.max_pending = max_per_hour, retry_seconds, max_pending
         self._send_mail, self.clock = sender, clock
         self.pending: list[Outgoing] = []
         self.retry_at = 0.0
         self.sent_times: list[float] = []
         self.dropped = 0
+
+    def allows(self, it: Outgoing) -> bool:
+        if it.rule_id in ALWAYS_EMAIL:
+            return True
+        if self.events is not None:
+            return event_group(it.rule_id) in self.events
+        return LEVEL.get(it.severity, 0) >= self.min_level
+
+    def requeue(self, items: list[Outgoing]) -> None:
+        """服务重启后，把还在等待合并的提醒放回队列（由调用方从 alerts 表恢复）。"""
+        self.pending.extend(items)
 
     def send(self, text: str, severity: str = "info") -> tuple[bool, str]:  # 单条（测试邮件等）
         try:
@@ -204,8 +271,8 @@ class EmailNotifier(Notifier):
         now = self.clock() if now is None else now
         results: list[Result] = []
         for it in items:
-            if LEVEL.get(it.severity, 0) < self.min_level:
-                results.append((it, False, "email: 低于邮件通知级别，未发送"))
+            if not self.allows(it):
+                results.append((it, False, "email: " + SKIPPED))
             else:
                 self.pending.append(it)
         if len(self.pending) > self.max_pending:  # 防止长期故障时无限堆积
@@ -218,6 +285,11 @@ class EmailNotifier(Notifier):
             return results
         if now < self.retry_at:
             return results + [(it, False, "email: 上次发送失败，等待重试") for it in items if it in self.pending]
+        urgent = any(p.severity == "urgent" for p in self.pending)
+        oldest = min(p.created for p in self.pending)
+        if not urgent and self.batch_s > 0 and now - oldest < self.batch_s:
+            at = time.strftime("%H:%M", time.localtime(oldest + self.batch_s))
+            return results + [(it, False, f"email: {HELD}，约 {at} 汇总发送") for it in items if it in self.pending]
         self.sent_times = [t for t in self.sent_times if now - t < 3600]
         if len(self.sent_times) >= self.max_per_hour:
             return results + [(it, False, "email: 达到每小时上限，稍后合并补发") for it in items if it in self.pending]
@@ -247,7 +319,7 @@ class EmailNotifier(Notifier):
         lines = []
         late = [b for b in batch if now - b.created > 120]
         if late:
-            lines.append(f"（其中 {len(late)} 条因限流或发送失败延后送达，请以邮件中的数据时间为准）\n")
+            lines.append(f"（其中 {len(late)} 条是汇总或延后送达的，请以每条里的数据时间为准）\n")
         if self.dropped:
             lines.append(f"（之前积压过多，已丢弃 {self.dropped} 条较早的提醒）\n")
         for b in order:

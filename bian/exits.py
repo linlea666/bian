@@ -7,7 +7,10 @@
    - 领航员在我离场 ±窗口内平仓 / 减仓 → 跟随平仓；
    - 领航员更晚才平（或还拿着）→ 提前离场 / 提前部分离场（统一叫法，不细分手动 / 止损单）；
    - 领航员早就平了、我后来才平 → 滞后平仓（残留仓位）；
+   - 领航员还整仓拿着（他的已平仓历史里查不到这个仓位）：离场后他的历史又成功同步过一次仍查不到，
+     就认定他还在持仓 → 提前离场，等他平仓后结算；
    - 30 天内找不到领航员的对应仓位 → 未知。
+实时记录器看不到的平仓（凭证失效 / 停机期间、一个轮询周期内开平）由 backfill() 用我的历史仓位补出。
 4. 领航员最终平仓后结算反事实：
    - 亏损离场：止损挽回 X U / 白止损 X U；盈利离场：避免回吐 X U / 少赚 X U；
    - 假设结果 =（领航员平仓均价 − 我的开仓价）× 离场数量 × 方向 − 同等手续费。
@@ -25,6 +28,9 @@ FILL_SLACK_S = 90
 FALLBACK_AFTER_S = 2 * 3600  # 2 小时还没同步到成交，就用回合里的估算值
 MAX_PENDING_S = 30 * 86400
 FEE_RATE = 0.0005
+HOLD_CONFIRM_S = 300  # 离场 5 分钟之后的成功同步仍查不到领航员平仓 → 认定他还拿着
+BACKFILL_MATCH_S = 600  # 回补时：开仓 ~ 平仓后 10 分钟内已有离场记录的，视为已记录
+AUTO_TYPES = ("待判定", "提前离场", "提前部分离场")  # 自动判定、结算前允许随新数据重新定性的类型
 
 
 @dataclass
@@ -105,6 +111,11 @@ def _remarks(store, ex: dict, ep: dict, actual_u: float | None, exit_s: float) -
     return out
 
 
+def _remark_text(store, ex: dict, ep: dict | None) -> str:
+    keep = ["历史回补"] if "历史回补" in (ex.get("remarks") or "") else []
+    return "、".join(keep + _remarks(store, ex, ep, ex["actual_u"], ex["ts"]))
+
+
 def resolve(store, poll_s: float = 20, now: float | None = None) -> list[dict]:
     """处理所有待判定 / 等领航员结果的离场记录。返回本次给出结论的记录（用于事件和摘要）。"""
     now = now or time.time()
@@ -128,15 +139,21 @@ def resolve(store, poll_s: float = 20, now: float | None = None) -> list[dict]:
         ex = {**ex, **upd}
         exit_ms = ex["ts"] * 1000
         # 2) 领航员对应仓位
-        lp = leader_match(store, ex["lead_id"], ex["symbol"], ex["side"], (ep or {}).get("opened_ts") or ex["ts"])
+        opened = (ep or {}).get("opened_ts") or ex.get("opened_ts") or ex["ts"]
+        lp = leader_match(store, ex["lead_id"], ex["symbol"], ex["side"], opened)
         manual = bool(ex["manual"])
         etype = ex["exit_type"]
         status = ex["status"]
         if lp is None:
             if now - (ex["created"] or ex["ts"]) > MAX_PENDING_S:
                 upd.update(status="done", verdict="未知", verdict_ts=now)
-                if not manual and etype == "待判定":
+                if not manual and etype in AUTO_TYPES:
                     upd["exit_type"] = "未知"
+            elif not manual and etype in AUTO_TYPES and _synced_after(store, ex["lead_id"], ex["ts"] + HOLD_CONFIRM_S):
+                # 他的已平仓历史只有平过的仓位：离场后成功同步过仍查不到 → 他还整仓拿着
+                upd.update(exit_type="提前部分离场" if ex["partial"] else "提前离场", status="waiting")
+                if status == "pending":
+                    upd["remarks"] = _remark_text(store, ex, ep)
             _save(store, ex["id"], upd)
             if upd.get("status") == "done":
                 row = {**ex, **upd}
@@ -147,7 +164,7 @@ def resolve(store, poll_s: float = 20, now: float | None = None) -> list[dict]:
         closed = lp.status == "All Closed" and lp.closed_ms
         follow = (closed and abs(lp.closed_ms - exit_ms) <= window_ms) or \
                  (not closed and lp.update_ms and abs(lp.update_ms - exit_ms) <= window_ms and ex["partial"])
-        if not manual and etype == "待判定":
+        if not manual and etype in AUTO_TYPES:  # 结算前按最新数据重新定性（例如之前以为他还拿着）
             if follow:
                 etype = "跟随平仓"
             elif closed and lp.closed_ms < exit_ms - window_ms:
@@ -166,13 +183,57 @@ def resolve(store, poll_s: float = 20, now: float | None = None) -> list[dict]:
         else:
             upd["status"] = "waiting"  # 领航员还拿着：等他平仓后结算
         if upd.get("status") == "done" or status == "pending":
-            upd["remarks"] = "、".join(_remarks(store, ex, ep, ex["actual_u"], ex["ts"]))
+            upd["remarks"] = _remark_text(store, ex, ep)
         _save(store, ex["id"], upd)
         if upd.get("status") == "done":
             row = {**ex, **upd}
             done.append(row)
             _log_verdict(store, row)
     return done
+
+
+def _synced_after(store, lead_id: str, ts: float) -> bool:
+    row = store.db.execute("SELECT history_ok FROM leaders WHERE lead_id=?", (lead_id,)).fetchone()
+    return bool(row and row[0] and row[0] >= ts)
+
+
+def backfill(store, poll_s: float = 20, now: float | None = None) -> int:
+    """用我的历史仓位补出实时记录器漏掉的离场（凭证失效 / 停机期间平仓、第二期上线前的平仓、
+    一个轮询周期内开平）。只读本地数据库、不请求币安；只看近 30 天全部平仓的仓位。返回补了几条。"""
+    now = now or time.time()
+    since_ms = int((now - MAX_PENDING_S) * 1000)
+    added = 0
+    for m in _rows(store, "SELECT m.*, COALESCE(l.name, m.lead_id) AS leader_name FROM my_positions m "
+                          "LEFT JOIN leaders l ON l.lead_id=m.lead_id "
+                          "WHERE m.status='All Closed' AND m.closed_ms >= ? ORDER BY m.closed_ms", (since_ms,)):
+        if m["side"] not in ("LONG", "SHORT") or not m["opened_ms"]:
+            continue
+        opened_s, closed_s = m["opened_ms"] / 1000, m["closed_ms"] / 1000
+        known = store.db.execute(
+            "SELECT 1 FROM exits WHERE lead_id=? AND symbol=? AND side=? AND ts BETWEEN ? AND ? LIMIT 1",
+            (m["lead_id"], m["symbol"], m["side"], opened_s - 60, closed_s + BACKFILL_MATCH_S)).fetchone()
+        if known:
+            continue
+        ep = store.db.execute(
+            "SELECT id FROM episodes WHERE source='copy' AND leader_id=? AND symbol=? AND side=? "
+            "AND ABS(opened_ts-?) <= 900 ORDER BY ABS(opened_ts-?) LIMIT 1",
+            (m["lead_id"], m["symbol"], m["side"], opened_s, opened_s)).fetchone()
+        qty = m["closed_qty"] or m["max_qty"] or 0
+        if qty <= 0:
+            continue
+        ex = {"lead_id": m["lead_id"], "symbol": m["symbol"], "side": m["side"], "ts": closed_s, "created": closed_s}
+        f = closing_fills(store, ex, poll_s)  # 成交先于历史仓位同步，正常都能找到
+        actual, fee, price = (f["realized"] + f["fee"], f["fee"], f["price"]) if f else (m["pnl"], None, m["avg_close"])
+        store.db.execute(
+            "INSERT INTO exits (episode_id, lead_id, leader_name, symbol, side, ts, qty, entry, price, partial, roi, "
+            "actual_u, fee, exit_type, remarks, status, created, opened_ts) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?)",
+            (ep[0] if ep else None, m["lead_id"], m["leader_name"], m["symbol"], m["side"], closed_s, qty,
+             m["avg_cost"], price, m["roi"], actual, fee, "待判定", "历史回补", "pending", now, opened_s))
+        added += 1
+    if added:
+        store.db.commit()
+        store.log_event("exit.backfill", f"从历史仓位补出 {added} 条离场记录（实时监控没看到的平仓）", n=added)
+    return added
 
 
 def _save(store, exit_id: int, upd: dict) -> None:

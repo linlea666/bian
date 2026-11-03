@@ -84,18 +84,36 @@ def upsert_leader_history(store, lead_id: str, rows: list[dict]) -> int:
 
 
 def ensure_leader(store, lead_id: str, name: str, kind: str) -> bool:
-    """登记关注的领航员；返回是否新加入（新加入的会触发历史分析任务）。kind：copy 跟单中 / watch 观察。"""
+    """登记关注的领航员；返回是否新加入（新加入的会触发历史分析任务）。
+    kind：copy 跟单中 / watch 观察。跟单中的不会被降为观察；已停止跟单（ended）的：重新跟单 → copy，
+    手动分析 / 转为观察 → watch。"""
     row = store.db.execute("SELECT kind FROM leaders WHERE lead_id=?", (lead_id,)).fetchone()
     now = time.time()
     if row:
-        store.db.execute("UPDATE leaders SET name=?, kind=CASE WHEN ?='copy' THEN 'copy' ELSE kind END, updated=? "
-                         "WHERE lead_id=?", (name, kind, now, lead_id))
+        new_kind = "copy" if kind == "copy" else ("watch" if row[0] == "ended" else row[0])
+        store.db.execute("UPDATE leaders SET name=?, kind=?, ended_ts=CASE WHEN ?='ended' THEN ended_ts ELSE NULL END, "
+                         "updated=? WHERE lead_id=?", (name, new_kind, new_kind, now, lead_id))
         store.db.commit()
         return False
     store.db.execute("INSERT INTO leaders (lead_id, name, kind, added, history_synced, updated) VALUES (?,?,?,?,NULL,?)",
                      (lead_id, name, kind, now, now))
     store.db.commit()
     return True
+
+
+def mark_copy_set(store, live_ids, now: float | None = None) -> list[str]:
+    """按最新的跟单列表更新状态：不在列表里的“跟单中”标为“已停止跟单”（包括服务停机期间停止的），
+    重新出现的恢复为“跟单中”。只改已登记的领航员；新出现的由同步线程登记（并排队分析）。返回新标记为停止的 ID。"""
+    now = now or time.time()
+    live = {str(x) for x in live_ids}
+    ended = [lid for (lid,) in store.db.execute("SELECT lead_id FROM leaders WHERE kind='copy'") if lid not in live]
+    for lid in ended:
+        store.db.execute("UPDATE leaders SET kind='ended', ended_ts=?, updated=? WHERE lead_id=?", (now, now, lid))
+    for lid in live:
+        store.db.execute("UPDATE leaders SET kind='copy', ended_ts=NULL, updated=? WHERE lead_id=? AND kind<>'copy'",
+                         (now, lid))
+    store.db.commit()
+    return ended
 
 
 def sync_copy_relation(client: Client, store, rel: dict, max_pages: int = 40, full: bool = False) -> dict:
@@ -125,6 +143,7 @@ def sync_leader_history(client: Client, store, lead_id: str, max_pages: int = 30
         total += n
         if rows and n == 0 and not full:
             break
-    store.db.execute("UPDATE leaders SET history_synced=? WHERE lead_id=?", (time.time(), lead_id))
+    now = time.time()  # 走到这里说明全部页都成功拿到了
+    store.db.execute("UPDATE leaders SET history_synced=?, history_ok=? WHERE lead_id=?", (now, now, lead_id))
     store.db.commit()
     return total

@@ -251,3 +251,70 @@ def grid_search(
         test_best = run(test, train_best.params, costs)
         test_base = run(test, RuleParams(), costs)
     return GridReport(baseline, ranked, stop_only, train_best, test_base, test_best, len(train), len(test))
+
+
+# ============================================================== 分批止盈阶梯（第三期）
+def simulate_ladder(path: Path, levels: list[tuple[float, float]], costs: Costs) -> TradeResult:
+    """分批止盈：浮盈第一次碰到某级 ROI 时按挂单价平掉该级比例，剩下的跟随领航员平仓。
+    levels = [(ROI, 比例), ...]，按 ROI 从低到高。开盘就跳过某级时按开盘价成交（对我有利，仍保守取挂单价）。
+    手续费：开平的名义价值总量不变，和原始跟单一样只算一次往返手续费。"""
+    cp = path.cp
+    base = path.final_roi - costs.roi_cost(cp.leverage, False)
+    taken, realized, i = 0.0, 0.0, 0
+    for _, favorable, _, _ in path.steps:
+        while i < len(levels) and favorable >= levels[i][0]:
+            frac = min(levels[i][1], 1.0 - taken)
+            realized += frac * levels[i][0]
+            taken += frac
+            i += 1
+    result = realized + (1.0 - taken) * path.final_roi - costs.roi_cost(cp.leverage, False)
+    return TradeResult(cp, base, result, "ladder" if taken > 0 else "leader_close")
+
+
+def _round5(x: float) -> float:
+    return max(0.05, round(x * 20) / 20)  # 取整到 5%，方便在币安挂单
+
+
+def ladder_candidates(p50: float, p75: float) -> list[list[tuple[float, float]]]:
+    a, b = _round5(p50), _round5(p75)
+    out = [[(a, 1 / 3), (b, 1 / 3)], [(a, 0.5)], [(b, 0.5)]]
+    return [c for i, c in enumerate(out) if c not in out[:i] and all(x[0] > 0 for x in c)]
+
+
+def ladder_label(levels: list[tuple[float, float]]) -> str:
+    return " → ".join(f"+{lv * 100:.0f}% 平 {'1/3' if abs(f - 1 / 3) < 1e-6 else f'{f:.0%}'}" for lv, f in levels) \
+        + "，其余跟随"
+
+
+def ladder_search(paths: list[Path], p50: float, p75: float, costs: Costs | None = None,
+                  train_frac: float = 0.7) -> dict | None:
+    """按盈利单最高浮盈的 P50 / P75 生成候选阶梯，和“不止盈”对比；时间靠前 70% 选方案，后 30% 检验。"""
+    costs = costs or Costs()
+    if len(paths) < 10 or not p50 or p50 <= 0:
+        return None
+    cands = ladder_candidates(p50, p75 or p50)
+
+    def run_ladder(ps, levels):
+        return summarize(RuleParams(), [simulate_ladder(p, levels, costs) for p in ps])
+
+    def js(levels, s: Summary, base: Summary) -> dict:
+        return {"levels": [[lv, f] for lv, f in levels], "label": ladder_label(levels), "total": s.total,
+                "baseline": base.total, "gain": s.total - base.total, "max_dd": s.max_dd,
+                "winners_trimmed": s.winners_cut, "given_up": s.profit_given_up, "saved": s.loss_saved}
+
+    base = run(paths, RuleParams(), costs)
+    rows = [js(c, run_ladder(paths, c), base) for c in cands]
+    ordered = sorted(paths, key=lambda p: p.cp.closed)
+    cut = int(len(ordered) * train_frac)
+    train, test = ordered[:cut], ordered[cut:]
+    oos = None
+    if len(train) >= 20 and len(test) >= 10:
+        best = max(cands, key=lambda c: run_ladder(train, c).total)
+        tb = run(test, RuleParams(), costs)
+        oos = {"levels": [[lv, f] for lv, f in best], "label": ladder_label(best), "n_train": len(train),
+               "n_test": len(test), "test_total": run_ladder(test, best).total, "test_baseline": tb.total}
+    # 推荐：用前 70% 选出的那个阶梯，要求它在后 30%（没参与挑选）和全样本上都比“不止盈”好
+    rec = None
+    if oos and oos["test_total"] > oos["test_baseline"]:
+        rec = next((r for r in rows if r["levels"] == oos["levels"] and r["gain"] > 0), None)
+    return {"candidates": rows, "oos": oos, "p50": p50, "p75": p75, "recommended": rec}

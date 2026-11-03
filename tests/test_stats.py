@@ -109,3 +109,41 @@ def test_maintenance_backup_failure_does_not_block_digest(tmp_path, monkeypatch)
     assert len(sent) == 1
     ev = store.db.execute("SELECT type, level FROM events WHERE type='maintenance.backup_failed'").fetchall()
     assert ev == [("maintenance.backup_failed", "warn")]
+
+
+def test_digest_mentions_recorded_only_alerts(tmp_path):
+    from bian import digest
+    from bian.notify import SKIPPED
+    from bian.rules import Alert
+
+    app = App(AppConfig(db_path="bian.db"), data_dir=str(tmp_path))
+    store = Store(app.db_path)
+    y = ts("2026-11-02 12:00")
+    for rule in ("R05", "R05", "R07", "L1"):
+        rid = store.add_alert(Alert(rule, "warn", "k", 1, "t", ts=y), "m", False, "待发送")
+        store.update_delivery(rid, rule == "L1", "" if rule == "L1" else "email: " + SKIPPED)
+    _, body = digest.build(store, app.settings, ts("2026-11-03 09:00"))
+    assert "浮盈回撤 2 条" in body and "领航员加仓 1 条" in body and "仓位亏损" not in body.split("没有发邮件")[1][:40]
+
+
+def test_restore_held_alerts_after_restart(tmp_path):
+    from bian.notify import EmailNotifier, Outgoing
+    from bian.rules import Alert
+
+    app = App(AppConfig(db_path="bian.db"), data_dir=str(tmp_path))
+    app.settings.update({"notify": {"smtp_user": "a@163.com"}})
+    app.settings.set_secrets(smtp_pass="x")
+    store = Store(app.db_path)
+    now = app.clock()
+    fresh = store.add_alert(Alert("L1", "warn", "k", 1, "t", ts=now - 600), "新", False, "email: 等待合并，约 10:00 汇总发送")
+    old = store.add_alert(Alert("L1", "warn", "k", 1, "t", ts=now - 7 * 3600), "旧", False, "email: 等待合并，约 01:00 汇总发送")
+    app.notifier()
+    assert app.restore_held(store) == 1
+    em = app._email()
+    assert isinstance(em, EmailNotifier) and [it.row_id for it in em.pending] == [fresh]
+    assert "过期" in store.db.execute("SELECT error FROM alerts WHERE id=?", (old,)).fetchone()[0]
+    # 改设置重建通知器：等待中的不丢
+    app.settings.update({"notify": {"email_batch_minutes": 30}})
+    app.notifier()
+    assert [it.row_id for it in app._email().pending] == [fresh]
+    assert Outgoing  # noqa: B018

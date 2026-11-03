@@ -13,7 +13,8 @@ from dataclasses import dataclass
 
 from .analysis import KlineCache
 from .api.market import INTERVAL_MS, pick_interval
-from .backtest import Costs, Summary, build_path, grid_search
+from .api import leaders as leaders_api
+from .backtest import Costs, Summary, build_path, grid_search, ladder_search
 from .client import BinanceError, Client
 from .models import ClosedPosition
 from .profile import profile
@@ -114,7 +115,7 @@ def step(store, public: Client, kline_client: Client, budget_s: float = 20.0, ca
             path = build_path(cp, bars, INTERVAL_MS[iv], iv)
             _set_path(store, lead_id, cp.position_id, path.mae, path.mfe, iv)
         _update(store, job_id, progress=total, total=total, message="计算画像和回测")
-        compute_profile(store, lead_id, kline_client, cache_dir)
+        compute_profile(store, lead_id, kline_client, cache_dir, mdd=leader_mdd(public, lead_id))
         _update(store, job_id, state="done", message="完成")
         store.log_event("job.done", f"领航员历史分析完成（{total} 笔）", leader_id=lead_id)
     except BinanceError as e:
@@ -145,8 +146,23 @@ def _summary_json(s: Summary | None) -> dict | None:
             "profit_given_up": s.profit_given_up, "loss_saved": s.loss_saved}
 
 
-def compute_profile(store, lead_id: str, kline_client: Client, cache_dir: str = ".cache/klines") -> dict:
-    """画像用已存的 MAE/MFE；回测需要逐根 K 线路径，从本地缓存读取（缓存被清掉的跳过）。"""
+def leader_mdd(public: Client, lead_id: str) -> float | None:
+    """领航员近 90 天最大回撤（%）：详情接口没有，按昵称在榜单里查（只读、2 个请求）。查不到返回 None。"""
+    try:
+        name = leaders_api.detail(public, lead_id).get("nickname")
+        if not name:
+            return None
+        _, found = leaders_api.leaderboard(public, time_range="90D", nickname=name, page_size=20)
+        hit = next((x for x in found if x.portfolio_id == lead_id), None)
+        return hit.mdd if hit and hit.mdd > 0 else None
+    except Exception:  # noqa: BLE001  只是补充信息：查不到不能让整个分析任务失败
+        return None
+
+
+def compute_profile(store, lead_id: str, kline_client: Client, cache_dir: str = ".cache/klines",
+                    mdd: float | None = None) -> dict:
+    """画像用已存的 MAE/MFE；回测需要逐根 K 线路径，从本地缓存读取（缓存被清掉的跳过）。
+    mdd：领航员近 90 天最大回撤（%），用于推荐跟单总止损比例。"""
     rows = _closed_positions(store, lead_id)
     closed = [cp for cp, _ in rows]
     stored = [StoredPath(cp, d["mae"], d["mfe"]) for cp, d in rows if d["mae"] is not None]
@@ -169,7 +185,10 @@ def compute_profile(store, lead_id: str, kline_client: Client, cache_dir: str = 
               "ranked": [_summary_json(x) for x in rep.ranked[:10]],
               "oos": {"train_best": _summary_json(rep.train_best), "test_baseline": _summary_json(rep.test_baseline),
                       "test_best": _summary_json(rep.test_best), "n_train": rep.n_train, "n_test": rep.n_test}}
-    data = {"profile": prof, "backtest": bt, "paths_n": len(paths), "stored_n": len(stored)}
+    ladder = ladder_search(paths, prof.get("winner_mfe_p50") or 0.0, prof.get("winner_mfe_p75") or 0.0) \
+        if prof.get("path_n") else None
+    data = {"profile": prof, "backtest": bt, "ladder": ladder, "mdd_90d": mdd,
+            "paths_n": len(paths), "stored_n": len(stored)}
     store.db.execute("INSERT OR REPLACE INTO leader_profiles (lead_id, computed_at, n, data) VALUES (?,?,?,?)",
                      (lead_id, time.time(), len(closed), json.dumps(data, ensure_ascii=False, default=str)))
     store.db.commit()
@@ -184,10 +203,17 @@ def get_profile(store, lead_id: str) -> dict | None:
 
 
 def needs_refresh(store, lead_id: str) -> bool:
-    """有新的已平仓记录（比画像多出 5 笔以上，或画像超过 3 天）时需要重新分析。"""
-    p = store.db.execute("SELECT computed_at, n FROM leader_profiles WHERE lead_id=?", (lead_id,)).fetchone()
+    """有新的已平仓记录（比画像多出 5 笔以上，或画像超过 3 天）时需要重新分析；
+    旧版本的分析结果（还没有止盈阶梯回测 / 最大回撤）也重新分析一次（K 线有缓存，很快）。"""
+    p = store.db.execute("SELECT computed_at, n, data FROM leader_profiles WHERE lead_id=?", (lead_id,)).fetchone()
     n = store.db.execute("SELECT COUNT(*) FROM leader_history WHERE lead_id=? AND status='All Closed'",
                          (lead_id,)).fetchone()[0]
     if not p:
         return True
+    if is_outdated(json.loads(p[2] or "{}")):
+        return True
     return n - (p[1] or 0) >= 5 or (time.time() - p[0] > 3 * 86400 and n != p[1])
+
+
+def is_outdated(data: dict) -> bool:
+    return "ladder" not in data or "mdd_90d" not in data

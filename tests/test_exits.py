@@ -164,3 +164,104 @@ def test_residual_detection_and_monitor_alert_once():
     mon.fetch = lambda _lr: next(seq)
     assert "R12" in [a.rule_id for a in mon.poll_once()]
     assert "R12" not in [a.rule_id for a in mon.poll_once()]  # 同一回合只提醒一次
+
+
+# ---------------------------------------------------------------- 领航员仍持仓 / 历史回补（M8）
+from bian import sync  # noqa: E402
+from bian.sync import ensure_leader, upsert_my_positions  # noqa: E402
+
+
+def _synced(store, ts):
+    store.db.execute("UPDATE leaders SET history_ok=? WHERE lead_id='L'", (ts,))
+    store.db.commit()
+
+
+def test_leader_still_holding_becomes_early_exit_after_successful_sync():
+    store, _ = setup_exit()
+    ensure_leader(store, "L", "测试", "copy")
+    upsert_fills(store, "L", [close_fill(T0 + 3590)])
+    exits.resolve(store, 20, now=T0 + 3700)
+    assert exits.exits_list(store)[0]["status"] == "pending"  # 还没有离场之后的成功同步
+    _synced(store, T0 + 3600 + 100)  # 离场后不到 5 分钟的同步不算
+    exits.resolve(store, 20, now=T0 + 3800)
+    assert exits.exits_list(store)[0]["status"] == "pending"
+    _synced(store, T0 + 3600 + 400)
+    exits.resolve(store, 20, now=T0 + 4100)
+    ex = exits.exits_list(store)[0]
+    assert (ex["exit_type"], ex["status"]) == ("提前离场", "waiting")
+    assert exits.summary(store)["waiting"] == 1
+    # 他后来在更差的价格平仓 → 结算为止损挽回
+    upsert_leader_history(store, "L", [leader(closed=T0 + 9000, avg_close=2200)])
+    (done,) = exits.resolve(store, 20, now=T0 + 9100)
+    assert (done["exit_type"], done["verdict"]) == ("提前离场", "止损挽回")
+
+
+def test_assumed_holding_is_corrected_to_follow_when_leader_record_appears():
+    store, _ = setup_exit()
+    ensure_leader(store, "L", "测试", "copy")
+    upsert_fills(store, "L", [close_fill(T0 + 3590)])
+    _synced(store, T0 + 4000)
+    exits.resolve(store, 20, now=T0 + 4100)
+    assert exits.exits_list(store)[0]["exit_type"] == "提前离场"
+    # 他的平仓记录延迟出现，其实和我同时平的 → 改为跟随平仓
+    upsert_leader_history(store, "L", [leader(closed=T0 + 3595, avg_close=2100)])
+    (done,) = exits.resolve(store, 20, now=T0 + 4200)
+    assert (done["exit_type"], done["verdict"]) == ("跟随平仓", "跟随")
+
+
+def test_failed_leader_sync_does_not_mark_history_ok(monkeypatch):
+    store = Store(":memory:")
+    ensure_leader(store, "L", "测试", "copy")
+
+    def boom(*a, **k):
+        raise RuntimeError("网络错误")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(sync.leaders_api, "iter_position_history_pages", boom)
+    with pytest.raises(RuntimeError):
+        sync.sync_leader_history(None, store, "L")
+    assert store.db.execute("SELECT history_ok FROM leaders").fetchone()[0] is None
+    monkeypatch.setattr(sync.leaders_api, "iter_position_history_pages", lambda *a, **k: iter([[]]))
+    sync.sync_leader_history(None, store, "L")
+    assert store.db.execute("SELECT history_ok FROM leaders").fetchone()[0] > 0
+
+
+def my_pos(pid="M1", opened=T0, closed=T0 + 3600, pnl=-45.12):
+    return {"positionId": pid, "symbol": "ETHUSDT", "side": "Short", "opened": int(opened * 1000),
+            "closed": int(closed * 1000), "avgCost": 2000, "avgClosePrice": 2100, "maxOpenInterest": 1,
+            "closedVolume": 1, "leverage": "20", "closingPnl": pnl, "roi": "-1.0", "status": "All Closed",
+            "updateTime": int(closed * 1000)}
+
+
+def test_backfill_closes_missed_by_live_recorder():
+    """第二期上线前 / 凭证失效期间手动止损的仓位：用历史仓位补出离场记录，之后照常判定。"""
+    store = Store(":memory:")
+    ensure_leader(store, "L", "测试", "copy")
+    upsert_fills(store, "L", [close_fill(T0 + 3600, realized=-46.0, fee=-1.0)])
+    upsert_my_positions(store, "L", [my_pos()])
+    now = T0 + 7200
+    assert exits.backfill(store, 20, now) == 1
+    assert exits.backfill(store, 20, now) == 0  # 不重复补
+    ex = exits.exits_list(store)[0]
+    assert ex["actual_u"] == pytest.approx(-47.0) and ex["remarks"] == "历史回补" and ex["opened_ts"] == T0
+    _synced(store, now)
+    exits.resolve(store, 20, now)
+    ex = exits.exits_list(store)[0]
+    assert (ex["exit_type"], ex["status"]) == ("提前离场", "waiting") and "历史回补" in ex["remarks"]
+    upsert_leader_history(store, "L", [leader(closed=T0 + 20000, avg_close=1950)])
+    (done,) = exits.resolve(store, 20, T0 + 20100)
+    assert done["verdict"] == "白止损" and done["delta_u"] < 0 and "历史回补" in done["remarks"]
+
+
+def test_backfill_skips_positions_already_recorded_live_and_old_ones():
+    store, _ = setup_exit()  # 实时记录器已经记了这次平仓
+    upsert_my_positions(store, "L", [my_pos(), my_pos("OLD", opened=T0 - 40 * 86400, closed=T0 - 39 * 86400)])
+    assert exits.backfill(store, 20, T0 + 7200) == 0
+
+
+def test_backfill_without_fills_uses_position_pnl():
+    store = Store(":memory:")
+    upsert_my_positions(store, "L", [my_pos(pnl=-30.5)])
+    assert exits.backfill(store, 20, T0 + 7200) == 1
+    ex = exits.exits_list(store)[0]
+    assert ex["actual_u"] == pytest.approx(-30.5) and ex["leader_name"] == "L"

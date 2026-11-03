@@ -62,7 +62,7 @@ h3 { font-size: 15px; }
 .hidden { display: none !important; }
 
 /* ---------- 布局 ---------- */
-.app { display: grid; grid-template-columns: 200px 1fr; min-height: 100vh; }
+.app { display: grid; grid-template-columns: 200px minmax(0, 1fr); min-height: 100vh; }  /* minmax(0)：内容（宽表格）在自己的容器里滚动，不撑宽页面 */
 .side {
   background: var(--panel); border-right: 1px solid var(--line); padding: 16px 12px;
   position: sticky; top: 0; height: 100vh;
@@ -203,7 +203,7 @@ tr.sub td { background: var(--panel-2); font-size: 12px; }
 /* ---------- 手机 ---------- */
 @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 760px) {
-  .app { grid-template-columns: 1fr; }
+  .app { grid-template-columns: minmax(0, 1fr); }
   .side { position: fixed; bottom: 0; top: auto; left: 0; right: 0; height: auto; padding: 4px; border-right: 0; border-top: 1px solid var(--line); z-index: 40; }
   .side .logo, .side .foot { display: none; }
   .nav { display: grid; grid-template-columns: repeat(4, 1fr); }
@@ -248,10 +248,23 @@ th.sort { cursor: pointer; user-select: none; }
 tr.click { cursor: pointer; }
 tr.click:hover td { background: var(--panel-2); }
 select.sm-sel { width: auto; padding: 3px 6px; font-size: 12px; }
-@media (max-width: 1100px) { .grid.two { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .grid.two { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 760px) {
   .nav { grid-template-columns: repeat(6, 1fr); }
   .nav a { font-size: 10px; }
   .cal-cell { min-height: 46px; padding: 3px; }
   .cal-cell .v { font-size: 10px; }
 }
+
+/* ---------- 第三期 / 邮件降噪 ---------- */
+.tabs button.tab { background: none; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; color: var(--muted); cursor: pointer; font: inherit; white-space: nowrap; }
+.tabs button.tab.on { color: var(--text); border-bottom-color: var(--brand); font-weight: 600; }
+.chk { display: flex; align-items: center; gap: 6px; margin: 6px 0; font-size: 14px; cursor: pointer; }
+.chk input { width: auto; margin: 0; }
+.chips-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0 10px; font-size: 13px; color: var(--muted); }
+.ev-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 0 14px; }
+.rec-list { margin: 6px 0 0; padding-left: 18px; }
+.rec-list li { margin: 3px 0; }
+.danger-zone { border-color: color-mix(in srgb, var(--red) 40%, var(--line)); }
+.card-h { flex-wrap: wrap; }  /* 标题右侧按钮多时换行（手机） */
+fieldset { min-width: 0; }  /* 浏览器默认 min-width: min-content，会被里面的长内容撑宽 */
