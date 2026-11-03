@@ -60,7 +60,61 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS todos_done (
   key TEXT PRIMARY KEY, ts REAL
 );
+-- ===== 第二期 =====
+-- 我的跟单逐笔成交（私有接口同步，含历史回补）。时间单位：毫秒（与币安接口一致）
+CREATE TABLE IF NOT EXISTS fills (
+  uid TEXT PRIMARY KEY, lead_id TEXT, ts_ms INTEGER, symbol TEXT, side TEXT, position_side TEXT,
+  price REAL, qty REAL, quote_qty REAL, fee REAL, realized REAL
+);
+CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts_ms);
+CREATE INDEX IF NOT EXISTS idx_fills_lead ON fills(lead_id, ts_ms);
+-- 我的跟单历史仓位（私有接口同步）
+CREATE TABLE IF NOT EXISTS my_positions (
+  uid TEXT PRIMARY KEY, lead_id TEXT, position_id TEXT, symbol TEXT, side TEXT,
+  opened_ms INTEGER, closed_ms INTEGER, avg_cost REAL, avg_close REAL, max_qty REAL, closed_qty REAL,
+  leverage REAL, pnl REAL, roi REAL, status TEXT, update_ms INTEGER, updated REAL
+);
+CREATE INDEX IF NOT EXISTS idx_mypos_lead ON my_positions(lead_id, opened_ms);
+-- 领航员公开已平仓历史（含部分平仓），以及按 K 线估算的 MAE/MFE
+CREATE TABLE IF NOT EXISTS leader_history (
+  lead_id TEXT, position_id TEXT, symbol TEXT, side TEXT, opened_ms INTEGER, closed_ms INTEGER,
+  avg_cost REAL, avg_close REAL, max_qty REAL, closed_qty REAL, leverage REAL, pnl REAL, roi REAL,
+  status TEXT, update_ms INTEGER, mae REAL, mfe REAL, path_interval TEXT, updated REAL,
+  PRIMARY KEY (lead_id, position_id)
+);
+CREATE INDEX IF NOT EXISTS idx_lh_open ON leader_history(lead_id, opened_ms);
+-- 关注的领航员（跟单中 / 观察）
+CREATE TABLE IF NOT EXISTS leaders (
+  lead_id TEXT PRIMARY KEY, name TEXT, kind TEXT, added REAL, history_synced REAL, updated REAL
+);
+CREATE TABLE IF NOT EXISTS leader_profiles (
+  lead_id TEXT PRIMARY KEY, computed_at REAL, n INTEGER, data TEXT
+);
+-- 后台分析任务（可断点续传）
+CREATE TABLE IF NOT EXISTS jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, lead_id TEXT, kind TEXT, state TEXT,
+  progress INTEGER, total INTEGER, message TEXT, created REAL, updated REAL
+);
+-- 每次离场（全部或部分）一行：离场类型、反事实结论
+CREATE TABLE IF NOT EXISTS exits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INTEGER, lead_id TEXT, leader_name TEXT,
+  symbol TEXT, side TEXT, ts REAL, qty REAL, entry REAL, price REAL, partial INTEGER,
+  roi REAL, actual_u REAL, fee REAL, exit_type TEXT, remarks TEXT, status TEXT,
+  leader_position_id TEXT, leader_close_ms INTEGER, leader_close_price REAL,
+  hypo_u REAL, delta_u REAL, verdict TEXT, verdict_ts REAL, manual INTEGER DEFAULT 0, created REAL
+);
+CREATE INDEX IF NOT EXISTS idx_exits_status ON exits(status);
+-- 回合内采样点（约 5 分钟一个），用于时间线
+CREATE TABLE IF NOT EXISTS episode_points (
+  episode_id INTEGER, ts REAL, roi REAL, u REAL, mark REAL
+);
+CREATE INDEX IF NOT EXISTS idx_points ON episode_points(episode_id, ts);
 """
+
+MIGRATIONS = [
+    # (表, 列, 定义)：只增不改，旧库升级时自动补列
+    ("equity", "profit_shared", "REAL"),
+]
 
 
 class Store:
@@ -71,7 +125,15 @@ class Store:
         if path != ":memory:":
             self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self._last_digest: dict[str, str] = {}
+
+    def _migrate(self) -> None:
+        for table, col, decl in MIGRATIONS:
+            cols = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.db.commit()
 
     def add_alert(self, a, message: str, delivered: bool, error: str) -> int:
         cur = self.db.execute(
@@ -185,9 +247,10 @@ class Store:
 
     # ------------------------------------------------------------ 权益快照
     def add_equity(self, ts: float, leader_id: str, equity: float, invested: float,
-                   unrealized: float, realized: float) -> None:
-        self.db.execute("INSERT INTO equity VALUES (?,?,?,?,?,?)",
-                        (ts, leader_id, equity, invested, unrealized, realized))
+                   unrealized: float, realized: float, profit_shared: float | None = None) -> None:
+        self.db.execute(
+            "INSERT INTO equity (ts, leader_id, equity, invested, unrealized, realized, profit_shared) "
+            "VALUES (?,?,?,?,?,?,?)", (ts, leader_id, equity, invested, unrealized, realized, profit_shared))
         self.db.commit()
 
     def equity_series(self, since: float, leader_id: str | None = None) -> list[tuple]:

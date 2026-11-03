@@ -83,6 +83,13 @@ def profile(closed: list[ClosedPosition], paths: list[Path] | None = None) -> di
             profit_to_loss_rate=(
                 sum(1 for p in big_mfe if p.final_roi < 0) / len(big_mfe) if big_mfe else 0.0
             ),
+            # 盈利单通常能涨到多少（最大浮盈分位数）：用来设计分批止盈阶梯
+            winner_mfe_p25=_q([p.mfe for p in win_paths], 0.25),
+            winner_mfe_p50=_q([p.mfe for p in win_paths], 0.5),
+            winner_mfe_p75=_q([p.mfe for p in win_paths], 0.75),
+            # 浮盈曾 ≥20% 的单子，平均回吐了多少个 ROI 点（最大浮盈 − 最终）
+            giveback_avg=(statistics.mean([p.mfe - p.final_roi for p in big_mfe]) if big_mfe else 0.0),
+            big_mfe_n=len(big_mfe),
         )
     out["tags"] = tags(out)
     return out

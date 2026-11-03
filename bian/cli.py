@@ -226,6 +226,19 @@ def cmd_passwd(a) -> int:
     return 0
 
 
+def cmd_backup(a) -> int:
+    import os
+
+    from .backup import backup
+
+    cfg = _load_cfg_or_default(a.config)
+    db = cfg.db_path if os.path.isabs(cfg.db_path) else os.path.join(".", cfg.db_path)
+    path = backup(db, os.path.join(os.path.dirname(os.path.abspath(db)), "backups"),
+                  os.path.join(os.path.dirname(os.path.abspath(db)), "secrets.json"), a.keep)
+    print(f"已备份到 {path}")
+    return 0
+
+
 def cmd_doctor(a) -> int:
     from .doctor import run_doctor
 
@@ -306,6 +319,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--random", action="store_true", help="生成随机密码并打印（首次登录需修改）")
     p.add_argument("--if-missing", action="store_true", help="仅在还没有账号时创建（安装脚本使用）")
     p.set_defaults(fn=cmd_passwd)
+
+    p = sub.add_parser("backup", help="备份数据库和设置（保留最近 N 份）")
+    p.add_argument("-c", "--config", default="config.toml")
+    p.add_argument("--keep", type=int, default=7)
+    p.set_defaults(fn=cmd_backup)
 
     p = sub.add_parser("doctor", help="部署自检：网络、凭证、邮件、配置")
     p.add_argument("-c", "--config", default="config.toml")

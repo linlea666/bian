@@ -157,19 +157,26 @@ def _closed_from_raw(x: dict, lead: str) -> ClosedPosition:
     return leaders_api.parse_closed(x, lead)
 
 
+def match_one(symbol: str, side: str, opened_ms: int, candidates, used: set | None = None,
+              window_ms: int = 15 * 60_000):
+    """在候选里找“同币种 + 同方向 + 开仓时间最接近（±window）”的一个。candidates 需有 symbol/side/opened/position_id。"""
+    best, gap = None, window_ms + 1
+    for t in candidates:
+        if (used and t.position_id in used) or t.symbol != symbol or t.side != side:
+            continue
+        g = abs(t.opened - opened_ms)
+        if g < gap:
+            best, gap = t, g
+    return best if best is not None and gap <= window_ms else None
+
+
 def match_positions(mine: list[ClosedPosition], theirs: list[ClosedPosition], window_ms: int = 15 * 60_000):
     """按币种+方向+开仓时间（±15 分钟）把我的仓位和领航员的仓位配对。"""
     used: set[str] = set()
     pairs = []
     for m in mine:
-        best, gap = None, window_ms + 1
-        for t in theirs:
-            if t.position_id in used or t.symbol != m.symbol or t.side != m.side:
-                continue
-            g = abs(t.opened - m.opened)
-            if g < gap:
-                best, gap = t, g
-        if best is not None and gap <= window_ms:
+        best = match_one(m.symbol, m.side, m.opened, theirs, used, window_ms)
+        if best is not None:
             used.add(best.position_id)
             pairs.append((m, best))
     return pairs

@@ -62,8 +62,22 @@ DEFAULTS: dict = {
         "smtp_to": "",
     },
     "monitor": {"poll_seconds": 20, "loss_budget_u": 0.0},
+    "maintenance": {
+        "digest_enabled": True,  # 每日摘要邮件
+        "digest_time": "08:30",
+        "backup_enabled": True,  # 每天自动备份数据库和设置（保留 7 份）
+        "backup_time": "04:00",
+    },
     "onboarding_done": False,
 }
+
+
+def _valid_hhmm(v: str) -> bool:
+    try:
+        h, m = str(v).split(":")
+        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59 and len(m) == 2
+    except ValueError:
+        return False
 
 SECRET_KEYS = ("binance_p20t", "binance_csrftoken", "smtp_pass")
 
@@ -127,6 +141,11 @@ def validate(cfg: dict) -> dict:
     if not 10 <= m["poll_seconds"] <= 300:
         raise SettingsError("轮询间隔应在 10–300 秒之间")
     m["loss_budget_u"] = float(m.get("loss_budget_u") or 0)
+    mt = cfg["maintenance"]
+    for k in ("digest_time", "backup_time"):
+        if not _valid_hhmm(mt[k]):
+            raise SettingsError("时间格式应为 HH:MM，例如 08:30")
+    mt["digest_enabled"], mt["backup_enabled"] = bool(mt["digest_enabled"]), bool(mt["backup_enabled"])
     if cfg["preset"] not in PRESETS and cfg["preset"] != "custom":
         raise SettingsError("未知的预设")
     return cfg

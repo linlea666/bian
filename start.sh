@@ -106,21 +106,7 @@ case "$cmd" in
         bian_cli passwd --random -c "$(data_dir)/config.toml"
         ;;
     backup)
-        dir="$(data_dir)/backups"
-        install -d -m 700 -o "$SVC_USER" -g "$SVC_USER" "$dir"
-        stamp=$(date +%Y%m%d-%H%M%S)
-        runuser -u "$SVC_USER" -- python3 - "$(data_dir)/bian.db" "$dir/bian-$stamp.db" <<'PY'
-import sqlite3, sys
-src, dst = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2])
-src.backup(dst)
-dst.close()
-PY
-        if [[ -f "$(data_dir)/secrets.json" ]]; then
-            install -m 600 -o "$SVC_USER" -g "$SVC_USER" "$(data_dir)/secrets.json" "$dir/secrets-$stamp.json"
-        fi
-        find "$dir" -name 'bian-*.db' -printf '%T@ %p\n' | sort -rn | tail -n +8 | cut -d' ' -f2- | xargs -r rm -f
-        find "$dir" -name 'secrets-*.json' -printf '%T@ %p\n' | sort -rn | tail -n +8 | cut -d' ' -f2- | xargs -r rm -f
-        say "已备份到 $dir/bian-$stamp.db"
+        bian_cli backup -c "$(data_dir)/config.toml"
         ;;
     *)
         usage
