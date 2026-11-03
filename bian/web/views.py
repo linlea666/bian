@@ -117,8 +117,10 @@ def overview(store, settings, now: float | None = None) -> dict:
     positions, _ = store.get_runtime("positions", [])
     positions = positions or []
     smtp_ok = settings.smtp_config(cfg) is not None and cfg["notify"]["email_enabled"]
+    # 只把真正的发送错误算作失败：按级别有意不发、达到每小时上限稍后补发，都不是故障
     last_mail_fail = store.db.execute(
-        "SELECT ts, error FROM alerts WHERE error LIKE '%email:%' AND delivered = 0 AND ts > ? ORDER BY id DESC LIMIT 1",
+        "SELECT ts, error FROM alerts WHERE error LIKE '%email:%' AND delivered = 0 AND ts > ? "
+        "AND error NOT LIKE '%低于邮件通知级别%' AND error NOT LIKE '%达到每小时上限%' ORDER BY id DESC LIMIT 1",
         (now - 3600,)).fetchone()
     rules = cfg["rules"]
     for a in accounts:

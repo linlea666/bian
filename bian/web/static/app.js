@@ -1,7 +1,9 @@
 /* bian 风控作战室 —— 单页应用（原生 JS，无需构建） */
 "use strict";
 
-const S = { me: null, settings: null, page: "", timer: null, events: [], alerts: [] };
+// gen：路由代次。每次切换页面 +1；异步请求返回后代次不一致就丢弃结果，定时器也只属于创建它的那一代
+const S = { me: null, settings: null, page: "", timer: null, gen: 0, events: [], alerts: [], evFilter: null };
+const stale = (gen) => gen !== S.gen;
 const root = document.getElementById("root");
 
 /* ---------------- 术语解释（小白模式） ---------------- */
@@ -144,8 +146,9 @@ async function boot() {
   if (S.me.must_change) return renderChangePassword(true);
   S.settings = await api("GET", "/api/settings");
   if (!S.me.onboarding_done) return renderWizard(0);
+  // 只改 hash 时交给 hashchange 触发路由；hash 已存在才直接路由（避免同时跑两个 route）
   if (!location.hash) location.hash = "#/war";
-  route();
+  else route();
 }
 window.addEventListener("hashchange", () => S.me && S.me.onboarding_done !== false && route());
 
@@ -178,7 +181,7 @@ async function renderWizard(step) {
   bindEmailForm(() => setTimeout(() => renderWizard(2), 600));
   bindPresetCards(() => renderWizard(3));
   const done = document.getElementById("wDone");
-  if (done) done.onclick = async () => { await api("POST", "/api/onboarding/done", {}); S.me.onboarding_done = true; location.hash = "#/war"; route(); };
+  if (done) done.onclick = async () => { await api("POST", "/api/onboarding/done", {}); S.me.onboarding_done = true; if (location.hash === "#/war") route(); else location.hash = "#/war"; };
 }
 
 /* ---------------- 外壳 ---------------- */
@@ -202,7 +205,9 @@ function bindShell() {
 }
 
 async function route() {
+  const gen = ++S.gen;
   clearInterval(S.timer);
+  S.timer = null;
   document.querySelectorAll(".tip").forEach((t) => t.remove());
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   const page = parts[0] || "war";
@@ -213,14 +218,17 @@ async function route() {
     else if (page === "settings") await pageSettings(parts[1] || "credentials");
     else await pageWar();
   } catch (e) {
-    if (S.me) root.innerHTML = shell(page, "出错了", "", `<div class="card msg err">${esc(e.message)}</div>`);
+    if (S.me && !stale(gen)) root.innerHTML = shell(page, "出错了", "", `<div class="card msg err">${esc(e.message)}</div>`);
   }
+  if (stale(gen)) return; // 期间已切到别的页面：不绑定、不创建定时器
   bindShell();
   if (page === "war" || page === "positions") {
-    S.timer = setInterval(() => {
+    const timer = setInterval(() => {
+      if (stale(gen)) { clearInterval(timer); return; }
       if (document.hidden || document.activeElement?.matches("input,textarea,select")) return;
-      (page === "war" ? pageWar : pagePositions)().then(bindShell).catch(() => {});
+      (page === "war" ? pageWar : pagePositions)().then(() => !stale(gen) && bindShell()).catch(() => {});
     }, 15000);
+    S.timer = timer;
   }
 }
 
@@ -235,6 +243,7 @@ function statusChips(ov) {
 
 /* ---------------- 作战室 ---------------- */
 async function pageWar() {
+  const gen = S.gen;
   const [ov, eq] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/equity?days=30").catch(() => ({ points: [] }))]);
   const t = ov.totals;
   let banner = "";
@@ -279,6 +288,7 @@ async function pageWar() {
   }).join("")}</div>`
     : `<div class="card empty">${ov.credentials.state === "valid" ? "暂时没有进行中的跟单" : "设置币安凭证后，这里会显示你的每个跟单"}</div>`;
 
+  if (stale(gen)) return;
   root.innerHTML = shell("war", "作战室", statusChips(ov), `
     ${banner}
     <div class="section card"><div class="card-h"><h2>今日待办</h2><span class="muted small">按紧急程度排序</span></div>${todos}</div>
@@ -313,6 +323,7 @@ function chart(points) {
 
 /* ---------------- 持仓 ---------------- */
 async function pagePositions() {
+  const gen = S.gen;
   const [ov, pv] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/positions")]);
   const sorted = pv.positions.slice().sort((a, b) => (b.tier || 0) - (a.tier || 0) || (a.unrealized_pnl - b.unrealized_pnl));
   const mineList = sorted.filter((p) => p.source === "copy"), publicList = sorted.filter((p) => p.source !== "copy");
@@ -342,6 +353,7 @@ async function pagePositions() {
       <th>亏损档位${help("tier")}</th><th class="r">最深浮亏${help("mae")}</th><th class="r">最高浮盈${help("mfe")}</th><th class="r">持仓时长</th><th></th></tr></thead>
       <tbody>${rows(ps)}</tbody></table></div>`
     : `<div class="empty">${emptyText}</div>`;
+  if (stale(gen)) return;
   root.innerHTML = shell("positions", "持仓", statusChips(ov), `
     <div class="card"><div class="card-h"><h2>我的跟单仓位（${mineList.length}）</h2><span class="muted small">每 15 秒自动刷新 · 数据时间 ${dt(pv.updated)}</span></div>
     ${table(mineList, ov.credentials.state === "valid" ? "当前没有持仓" : "设置币安凭证后显示你的跟单仓位")}
@@ -355,6 +367,7 @@ const evLabel = (t) => EV_LABEL[String(t).split(".")[0]] || t;
 const EV_TYPES = [["", "全部类型"], ["position.", "仓位变化"], ["alert.", "提醒"], ["credential.", "凭证"], ["notify.", "邮件投递"],
   ["settings.", "设置修改"], ["data.", "数据中断/恢复"], ["leader.", "跟单增减"], ["service.", "服务"], ["auth.", "登录"]];
 async function pageRecords(tab) {
+  const gen = S.gen;
   const ov = await api("GET", "/api/overview");
   const tabs = [["alerts", "提醒记录"], ["events", "事件日志"], ["episodes", "仓位回合"]]
     .map(([k, t]) => `<a href="#/records/${k}" class="${k === tab ? "on" : ""}">${t}</a>`).join("");
@@ -390,15 +403,18 @@ async function pageRecords(tab) {
       <p class="hint">“利润回吐”：最高浮盈 ≥30% 但最后不到一半；“盈转亏”：最高浮盈 ≥30% 却亏损出场。这些数据会用于之后的分批止盈建议。</p>`
       : `<div class="empty">仓位回合从安装后开始记录，有持仓后这里会出现</div>`;
   }
+  if (stale(gen)) return;
   root.innerHTML = shell("records", "记录", statusChips(ov), `<div class="card"><div class="tabs">${tabs}</div>${body}</div>`);
   if (tab === "events") bindEvents();
-  root.querySelectorAll("[data-ep]").forEach((b) => (b.onclick = () => { location.hash = "#/records/events"; setTimeout(() => loadEvents(true, { episode: b.dataset.ep }), 50); }));
+  root.querySelectorAll("[data-ep]").forEach((b) => (b.onclick = () => { S.evFilter = { episode: b.dataset.ep }; location.hash = "#/records/events"; }));
 }
 function bindEvents() {
   document.getElementById("evGo").onclick = () => loadEvents(true);
   document.getElementById("evQ").onkeydown = (e) => e.key === "Enter" && loadEvents(true);
   document.getElementById("evMore").onclick = () => loadEvents(false);
-  loadEvents(true);
+  const pending = S.evFilter; // 从“仓位回合 → 时间线”跳过来时带的筛选，只用一次
+  S.evFilter = null;
+  loadEvents(true, pending || undefined);
 }
 async function loadEvents(reset, extra) {
   const list = document.getElementById("evList");
@@ -417,6 +433,7 @@ const val = (id) => (document.getElementById(id) || {}).value || "";
 
 /* ---------------- 设置 ---------------- */
 async function pageSettings(tab) {
+  const gen = S.gen;
   const [ov, st] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/settings")]);
   S.settings = st;
   const tabs = [["credentials", "币安凭证"], ["email", "邮件提醒"], ["rules", "风控参数"], ["account", "账号与系统"]]
@@ -428,6 +445,7 @@ async function pageSettings(tab) {
   if (tab === "account") body = renderChangePassword(false) + `<div class="card"><h3>系统</h3>
       <p class="muted small">版本 v${esc(S.me.version)}。更新：在服务器执行 <code>cd /opt/bian && ./start.sh update</code>（几秒钟，数据和设置都会保留）。</p>
       <p class="muted small">查看运行日志：<code>./start.sh logs</code>；自检：<code>./start.sh doctor</code>。</p></div>`;
+  if (stale(gen)) return;
   root.innerHTML = shell("settings", "设置", statusChips(ov), `<div class="card"><div class="tabs">${tabs}</div>${body}</div>`);
   if (tab === "credentials") bindCredForm(() => pageSettings("credentials").then(bindShell));
   if (tab === "email") bindEmailForm();

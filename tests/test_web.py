@@ -140,3 +140,21 @@ def test_password_change_rotates_session(web):
     assert c.call("GET", "/api/me")[0] == 200
     c2 = Client(c.base)
     assert c2.login("Passw0rd123")[0] == 401 and c2.login("NewPassw0rd9")[0] == 200
+
+
+def test_email_failure_chip_ignores_intentional_skips(web):
+    from bian.rules import Alert
+    from bian.web import views
+
+    app, c = web
+    store = Store(app.db_path)
+    a = Alert("R00", "info", "k", 0, "开仓", ts=__import__("time").time())
+    rid = store.add_alert(a, "x", False, "")
+    store.update_delivery(rid, False, "email: 低于邮件通知级别，未发送")
+    rid = store.add_alert(a, "x", False, "")
+    store.update_delivery(rid, False, "email: 达到每小时上限，稍后合并补发")
+    assert views.overview(store, app.settings)["email"]["last_failure"] is None  # 有意不发 ≠ 故障
+    rid = store.add_alert(a, "x", False, "")
+    store.update_delivery(rid, False, "email: SMTP 认证失败：请核对发件账号和邮箱“授权码”")
+    fail = views.overview(store, app.settings)["email"]["last_failure"]
+    assert fail and "认证失败" in fail["error"]
