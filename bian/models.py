@@ -18,8 +18,8 @@ class Position:
 
     leader_id: str
     symbol: str
-    side: str  # "LONG" / "SHORT"
-    qty: float  # 绝对值
+    side: str  # "LONG" / "SHORT" / "HEDGE"（同币种多空合并后的净值视图）
+    qty: float  # 绝对值；HEDGE 为多空数量之和
     entry_price: float
     mark_price: float
     leverage: float
@@ -36,7 +36,11 @@ class Position:
 
     @property
     def direction(self) -> int:
-        return 1 if self.side == "LONG" else -1
+        return {"LONG": 1, "SHORT": -1}.get(self.side, 0)  # HEDGE（多空合并）为 0
+
+    @property
+    def is_hedge(self) -> bool:
+        return self.side == "HEDGE"
 
     @property
     def margin(self) -> float:
@@ -63,8 +67,22 @@ class Position:
         return (price / self.entry_price - 1) * self.direction * max(self.leverage, 1)
 
     def price_at_roi(self, roi: float) -> float:
-        """某个 ROI 对应的价格（用于给出止损/保本建议价）。"""
+        """某个 ROI 对应的价格（用于给出止损/保本建议价）；多空合并仓没有单一价格，返回 0。"""
+        if self.is_hedge or self.entry_price <= 0:
+            return 0.0
         return self.entry_price * (1 + roi / max(self.leverage, 1) * self.direction)
+
+    def liquidation_valid(self, max_distance: float = 0.5) -> bool:
+        """强平价是否可信：必须在不利方向，且距标记价不超过 max_distance。
+        实测全仓 + 双向持仓时接口常给 0 或离谱的值（如现价 514、强平价 739467）。"""
+        liq, mark = self.liquidation_price, self.mark_price
+        if liq <= 0 or mark <= 0 or self.is_hedge:
+            return False
+        if self.side == "LONG" and not liq < mark:
+            return False
+        if self.side == "SHORT" and not liq > mark:
+            return False
+        return abs(mark - liq) / mark <= max_distance
 
 
 @dataclass

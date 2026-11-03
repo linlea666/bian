@@ -53,20 +53,31 @@ def copy_positions(client: Client, copy_portfolio_id: str, lead_portfolio_id: st
     return out
 
 
-def copy_trade_history(client: Client, copy_portfolio_id: str, page: int = 1, rows: int = 50) -> dict:
-    return client.post(
-        PRIV + "/copy-portfolio/trade-history",
-        {"copyTradeType": "COPY", "portfolioId": copy_portfolio_id, "page": page, "rows": rows},
-        private=True,
-    ) or {}
+def _paged(client: Client, path: str, copy_portfolio_id: str, max_pages: int, page_size: int) -> list[dict]:
+    """实测：分页参数是 pageNumber/pageSize（page/rows 会被忽略、固定返回 10 条）。"""
+    out: list[dict] = []
+    for page in range(1, max_pages + 1):
+        d = client.post(
+            PRIV + path,
+            {"copyTradeType": "COPY", "portfolioId": copy_portfolio_id, "pageNumber": page, "pageSize": page_size},
+            private=True,
+        ) or {}
+        rows = d.get("list") or []
+        out += rows
+        if len(rows) < page_size or len(out) >= int(d.get("total") or 0):
+            break
+    return out
 
 
-def copy_position_history(client: Client, copy_portfolio_id: str, page: int = 1, rows: int = 50) -> dict:
-    return client.post(
-        PRIV + "/copy-portfolio/position-history",
-        {"copyTradeType": "COPY", "portfolioId": copy_portfolio_id, "page": page, "rows": rows},
-        private=True,
-    ) or {}
+def copy_trade_history(client: Client, copy_portfolio_id: str, max_pages: int = 20, page_size: int = 50) -> list[dict]:
+    """我的逐笔成交：time, symbol, side, positionSide, price, qty, quantity(USDT), fee(负数=支出), realizedProfit。"""
+    return _paged(client, "/copy-portfolio/trade-history", copy_portfolio_id, max_pages, page_size)
+
+
+def copy_position_history(client: Client, copy_portfolio_id: str, max_pages: int = 20, page_size: int = 50) -> list[dict]:
+    """我的历史仓位（含部分平仓）：opened, closed, avgCost, avgClosePrice, maxOpenInterest, closedVolume,
+    closingPnl, leverage, roi, side, status。"""
+    return _paged(client, "/copy-portfolio/position-history", copy_portfolio_id, max_pages, page_size)
 
 
 def relation_summary(r: dict) -> dict:

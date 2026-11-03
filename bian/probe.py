@@ -93,5 +93,5 @@ def run_probe(client: Client, pid: str | None = None) -> list[str]:
                 pass
         row(rp, note)
         rh = _check(f"我的跟单成交 trade-history（{nick}）", lambda: copy_account.copy_trade_history(client, cpid))
-        row(rh, f"字段：{_keys((rh['result'] or {}).get('list') or [])}" if rh["ok"] else "")
+        row(rh, f"{len(rh['result'])} 笔；字段：{_keys(rh['result'])}" if rh["ok"] else "")
     return lines

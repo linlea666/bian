@@ -7,3 +7,4 @@ config.toml
 *.db
 .cache/
 reports/
+data/

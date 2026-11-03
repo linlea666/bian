@@ -1,0 +1,32 @@
+# 由 start.sh 根据安装目录生成到 /etc/systemd/system/bian.service，不要直接修改那份文件
+[Unit]
+Description=bian 币安跟单风控作战室（只读监控与提醒，不下单）
+Documentation=https://github.com/linlea666/bian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bian
+Group=bian
+WorkingDirectory=@PROJECT_DIR@/data
+Environment=PYTHONPATH=@PROJECT_DIR@
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=@TZ@
+ExecStart=/usr/bin/python3 -m bian.cli serve -c @PROJECT_DIR@/data/config.toml
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+# 与同机的其他项目（例如 joz / NOFX）隔离，资源占用压低
+MemoryMax=300M
+CPUWeight=50
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@PROJECT_DIR@/data
+
+[Install]
+WantedBy=multi-user.target
