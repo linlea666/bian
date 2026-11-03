@@ -33,6 +33,7 @@ const HELP = {
   email_events: "只有勾选的事件才发邮件，其余只在后台记录（每日摘要里会汇总条数）。同一事件当天只发一次，明显恶化才再发；紧急的立即发，其余按汇总间隔合并成一封。凭证失效邮件无论如何都会发。",
   rec_tiers: "推荐的亏损档位：取他历史上最后赚钱的单子，持仓过程中最深浮亏的 75% / 90% / 97% 分位。意思是大多数最后赚钱的单子不会跌到这么深，提醒响了说明这一单比他平时扛得更深。",
   rec_stop: "跟单总止损比例：他近 90 天最大回撤 × 1.2。正常波动不会触发，真失控时由币安自动全部平仓兜底。采用后，作战室里“建议总止损金额”按这个比例计算，需要你在币安自己设置。",
+  profit_guard: "盈利保护：浮盈达到一定比例后，把止损挪到保本价；再从最高浮盈回落若干个点时止盈。推荐的方案来自回测全组合：用前 70% 历史选出，在后 30% 和全部历史上都比原始跟单好才推荐。",
   ladder: "分批止盈阶梯：按他盈利单通常能涨到的浮盈（中位数 / 75% 分位）分批止盈，和“不止盈”对比。只有用前 70% 的历史选出、在后 30% 也更好的方案才推荐。采用后浮盈到位时提醒你在币安手动止盈（默认不发邮件）。",
   ended: "已停止跟单：你在币安已经不再跟这个领航员。数据默认一直保留；可以导出备份，或删除他的全部数据（删除前会自动备份一份到服务器）。",
 };
@@ -664,12 +665,14 @@ function readRules(f, prefix = "r_", only) {
   }));
   return out;
 }
-const OVERRIDE_KEYS = ["loss_tiers", "loss_tiers_mode", "min_alert_u", "recommend_total_stop_pct"];
-const OV_NAMES = { loss_tiers: "亏损档位", loss_tiers_mode: "档位方式", min_alert_u: "金额门槛", recommend_total_stop_pct: "建议总止损比例", tp_ladder: "分批止盈" };
+const OVERRIDE_KEYS = ["loss_tiers", "loss_tiers_mode", "min_alert_u", "recommend_total_stop_pct",
+  "breakeven_trigger_roi", "trail_trigger_roi", "trail_gap_roi"];
+const OV_NAMES = { loss_tiers: "亏损档位", loss_tiers_mode: "档位方式", min_alert_u: "金额门槛", recommend_total_stop_pct: "建议总止损比例", tp_ladder: "分批止盈",
+  breakeven_trigger_roi: "保本提醒门槛", trail_trigger_roi: "盯回撤门槛", trail_gap_roi: "回落多少提醒" };
 const ladderText = (lv) => (lv || []).map(([r, f]) => `+${Math.round(r * 100)}% 平 ${Math.abs(f - 1 / 3) < 1e-6 ? "1/3" : Math.round(f * 100) + "%"}`).join(" → ");
 function fmtOv(k, v) {
   if (k === "tp_ladder") return ladderText(v) || "关闭";
-  if (k === "recommend_total_stop_pct") return Math.round(v * 100) + "%";
+  if (["recommend_total_stop_pct", "breakeven_trigger_roi", "trail_trigger_roi", "trail_gap_roi"].includes(k)) return Math.round(v * 100) + "%";
   if (k === "loss_tiers_mode") return v === "price" ? "按价格波动" : "按 ROI";
   return Array.isArray(v) ? v.join("/") : v;
 }
@@ -717,6 +720,18 @@ function bindRulesForm() {
     } catch (err) { box.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
   };
   const of = document.getElementById("ovForm");
+  // 选中某个领航员时，表单显示他实际生效的值（全局 + 他的单独设置），避免保存时把已采用的推荐冲回全局值
+  const fillOv = () => {
+    const id = of.elements.leader.value;
+    const v = { ...S.settings.rules, ...((S.settings.leader_rules || {})[id] || {}) };
+    RULE_GROUPS.flatMap(([, items]) => items).filter((it) => OVERRIDE_KEYS.includes(it[0])).forEach(([key, , type]) => {
+      const el = of.elements["o_" + key];
+      if (!el || v[key] == null) return;
+      el.value = type === "list" ? v[key].join(", ") : type === "pct" ? +(v[key] * 100).toFixed(2) : v[key];
+    });
+  };
+  of.elements.leader.onchange = fillOv;
+  fillOv();
   of.onsubmit = async (e) => {
     e.preventDefault();
     const id = of.elements.leader.value, box = document.getElementById("ovMsg");
@@ -1051,20 +1066,31 @@ function recCard(r) {
   const cur = r.current || {};
   const curTiers = (cur.loss_tiers || []).map((t) => `-${t}%`).join(" / ") + (cur.loss_tiers_mode === "price" ? "（按价格波动）" : "");
   if (!r.ok) return `<div class="section card"><h3>止损 / 止盈推荐</h3><div class="empty">${esc(r.reason || "暂无推荐")}</div></div>`;
-  const notes = (r.tier_notes || []).map((n) => `<li><b>-${n.tier}%</b>：他最后赚钱的单子里约 ${num(n.winners_deeper * 100, 0)}% 曾跌到这里${n.losers_deeper != null ? `；亏钱的单子约 ${num(n.losers_deeper * 100, 0)}% 跌到这里` : ""}</li>`).join("");
-  const hs = r.hard_stop;
+  const last = (r.tier_notes || []).length - 1;
+  const notes = (r.tier_notes || []).map((n, i) => `<li><b>-${n.tier}%</b>：他最后赚钱的单子里约 ${num(n.winners_deeper * 100, 0)}% 曾跌到这里${n.losers_deeper != null ? `；亏钱的单子约 ${num(n.losers_deeper * 100, 0)}% 跌到这里` : ""}${i === last ? "。<b>到这一档考虑先减半</b>，之后看离场判定的结论再调整" : ""}</li>`).join("");
+  const hs = r.hard_stop, pg = r.profit_guard;
   const lad = r.ladder, curLad = cur.tp_ladder || [];
-  return `<div class="section grid two">
-    <div class="card"><h3>止损档位推荐 ${help("rec_tiers")}</h3>
+  // 一句话结论：单仓硬止损要不要设、提醒档位、盈利保护、总止损兜底
+  const verdict = [!hs ? "" : hs.better ? `单仓硬止损可参考“${hs.label}”` : "不设单仓硬止损（回测都不如不设）",
+    `用亏损提醒（${r.loss_tiers.map((t) => `-${t}%`).join(" / ")}）`,
+    pg && pg.adoptable ? `盈利保护（${pg.label}）` : "",
+    `跟单总止损兜底${r.total_stop_pct ? `（净投入 × ${num(r.total_stop_pct * 100, 0)}%）` : ""}`].filter(Boolean);
+  return `<div class="section card"><h3>这个领航员怎么设</h3><p><b>${esc(verdict.join(" + "))}</b></p>
+      <p class="muted small">亏损提醒只提醒、不平仓，到档位时由你决定；总止损在币安该跟单的设置里开启，是唯一由交易所自动执行的保护。</p></div>
+    <div class="section grid two">
+    <div class="card"><h3>亏损提醒档位（只提醒，不平仓） ${help("rec_tiers")}</h3>
       <p>推荐亏损档位：<b>${r.loss_tiers.map((t) => `-${t}%`).join(" / ")}</b> <span class="muted small">（当前：${esc(curTiers)}）</span></p>
       <ul class="rec-list small">${notes}</ul>
       ${r.total_stop_pct ? `<p>跟单总止损：<b>净投入 × ${num(r.total_stop_pct * 100, 0)}%</b> ${help("rec_stop")} <span class="muted small">他近 90 天最大回撤 ${num(r.mdd_90d, 1)}%；当前 ${num((cur.recommend_total_stop_pct || 0) * 100, 0)}%</span></p>`
         : `<p class="muted small">${r.outdated ? OUTDATED : "查不到他的近 90 天最大回撤（不在币安公开榜单上），总止损比例不做推荐。"}</p>`}
       ${hs ? `<p class="small">硬止损参考（回测）：${esc(hs.label)}，累计 ${signed(hs.total)}（不设止损 ${signed(hs.baseline_total)}），会误杀 ${hs.winners_cut} 笔盈利单${hs.better ? "" : "；<b>不如不设</b>，这个领航员更适合只用提醒 + 总止损兜底"}。</p>` : ""}
       ${r.my_note ? `<p class="msg">${esc(r.my_note)}</p>` : ""}
-      <div class="actions"><button class="btn primary sm" data-adopt="stops">采用档位${r.total_stop_pct ? "和总止损比例" : ""}</button></div>
+      <div class="actions">${String(cur.loss_tiers) === String(r.loss_tiers) && cur.loss_tiers_mode !== "price" && (!r.total_stop_pct || Math.abs(cur.recommend_total_stop_pct - r.total_stop_pct) < 1e-6)
+        ? '<span class="badge green">✓ 已采用</span>' : `<button class="btn primary sm" data-adopt="stops">采用档位${r.total_stop_pct ? "和总止损比例" : ""}</button>`}</div>
       <p class="hint">基于 ${r.n_paths} 笔算出浮亏的历史仓位。只对这个领航员生效，可在 设置 → 风控参数 → 按领航员单独设置 里修改或恢复全局。</p></div>
-    <div class="card"><h3>分批止盈阶梯 ${help("ladder")}</h3>
+    <div class="card"><h3>盈利保护 ${help("profit_guard")}</h3>
+      ${profitGuard(pg, cur, r.outdated)}
+      <h3 style="margin-top:16px">分批止盈阶梯 ${help("ladder")}</h3>
       ${curLad.length ? `<p>当前已开启：<b>${esc(ladderText(curLad))}</b>，其余跟随。浮盈到位时提醒你在币安手动止盈。</p>` : ""}
       ${lad ? `<p>推荐：<b>${esc(lad.label)}</b></p><p class="small">回测累计 ${signed(lad.total)}，不止盈 ${signed(lad.baseline)}（多 ${signed(lad.gain)}）；会少赚的大单 ${lad.winners_trimmed} 笔。用前 70% 历史选出、后 30% 验证仍更好。</p>
         <div class="actions"><button class="btn primary sm" data-adopt="ladder">采用止盈阶梯</button></div>`
@@ -1073,6 +1099,21 @@ function recCard(r) {
         ${r.ladder_candidates.map((c) => `<tr><td class="small">${esc(c.label)}</td><td class="r num">${signed(c.total)}</td><td class="r"><span class="num ${tone(rnd(c.gain, 2))}">${signed(c.gain)}</span></td></tr>`).join("")}</tbody></table></div>` : ""}
       ${curLad.length ? '<div class="actions"><button class="btn sm ghost" data-adopt="clear_ladder">关闭止盈提醒</button></div>' : ""}
       <p class="hint">收益单位 = 每笔投入 1 份保证金的倍数。止盈提醒默认不发邮件（设置 → 邮件提醒 里可以勾选“分批止盈到位”）。</p></div></div>`;
+}
+
+const near = (a, b) => a != null && b != null && Math.abs(a - b) < 1e-6;
+const guardAdopted = (p, cur) => (p.be_trigger == null || near(p.be_trigger, cur.breakeven_trigger_roi))
+  && (p.trail_gap == null || (near(p.trail_gap, cur.trail_gap_roi) && near(p.trail_trigger, cur.trail_trigger_roi)));
+function profitGuard(pg, cur, outdated) {
+  const now = `当前：浮盈 ${num(cur.breakeven_trigger_roi * 100, 0)}% 建议保本；浮盈 ≥${num(cur.trail_trigger_roi * 100, 0)}% 后回落 ${num(cur.trail_gap_roi * 100, 0)} 个点提醒止盈`;
+  if (!pg) return `<p class="muted small">${outdated ? OUTDATED : "回测里样本外最好的方案不含保本 / 回撤止盈，这个领航员不需要额外的盈利保护。"}</p><p class="muted small">${now}</p>`;
+  const cmp = `全部历史累计 ${signed(pg.total)}（原始跟单 ${signed(pg.baseline_total)}），最大回撤 ${num(pg.max_dd)}（原始 ${num(pg.baseline_dd)}），会误杀 ${pg.winners_cut} 笔盈利单；
+    前 ${pg.n_train} 笔选出、后 ${pg.n_test} 笔检验 ${signed(pg.test_total)}（原始 ${signed(pg.test_baseline)}）。`;
+  return `<p>${pg.adoptable ? "推荐" : "回测最好"}：<b>${esc(pg.label)}</b></p><p class="small">${cmp}</p>
+    ${pg.adoptable ? `<div class="actions">${guardAdopted(pg.params, cur) ? '<span class="badge green">✓ 已采用</span>' : '<button class="btn primary sm" data-adopt="profit">采用盈利保护</button>'}</div>
+      <p class="hint">采用后，浮盈到位时提醒你在币安把止损挪到保本、回落时手动止盈（币安跟单仓位不支持移动止盈）。这两类提醒默认不发邮件，可在 设置 → 邮件提醒 勾选“浮盈达标建议保本”“浮盈回撤”。</p>`
+      : `<p class="muted small">${pg.has_stop ? "这个方案带单仓硬止损，和“亏损只提醒”的建议冲突，不提供一键采用。" : "样本外没有比原始跟单更好，暂不推荐。"}</p>`}
+    <p class="muted small">${now}</p>`;
 }
 
 /* ---------- 仓位时间线 ---------- */

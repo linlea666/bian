@@ -82,7 +82,12 @@ def seed_history(store, lid="123", n=40):
         mae = -(0.05 + (i % 16) * 0.05) if i % 3 != 0 else -(0.4 + (i % 12) * 0.1)
         store.db.execute("UPDATE leader_history SET mae=?, mfe=0.5, path_interval='1m' WHERE lead_id=? AND position_id=?",
                          (mae, lid, str(i)))
-    data = {"profile": {"n": n}, "backtest": {"baseline": {"total": 1.0}, "stop_only": [
+    guard = {"label": "浮盈+50%保本 + 回撤10%止盈(≥+50%)", "params": {"stop_roi": None, "be_trigger": 0.5, "be_lock": 0.02,
+             "trail_gap": 0.1, "trail_trigger": 0.5}}
+    data = {"profile": {"n": n}, "backtest": {"baseline": {"total": 1.0, "max_dd": 3.0}, "oos": {
+        "train_best": {**guard, "total": 0.9}, "test_best": {**guard, "total": 0.4}, "test_baseline": {"total": 0.1},
+        "full_best": {**guard, "total": 1.3, "max_dd": 2.0, "winners_cut": 12}, "n_train": 28, "n_test": 12},
+        "stop_only": [
         {"label": "止损-30%", "total": 0.5, "winners_cut": 9}, {"label": "止损-70%", "total": 1.4, "winners_cut": 2}]},
         "ladder": {"recommended": {"levels": [[0.3, 0.5]], "label": "+30% 平 50%，其余跟随", "gain": 2.0},
                    "candidates": []}, "mdd_90d": 25.0}
@@ -114,6 +119,13 @@ def test_recommend_and_adopt(tmp_path):
     assert app.settings.rules_config("999").tp_ladder == ()  # 只对这个领航员生效
     recommend.adopt(store, app.settings, "123", "clear_ladder")
     assert app.settings.rules_config("123").tp_ladder == ()
+    pg = r["profit_guard"]
+    assert pg["adoptable"] and pg["total"] == 1.3 and pg["winners_cut"] == 12
+    recommend.adopt(store, app.settings, "123", "profit")
+    rc = app.settings.rules_config("123")
+    assert (rc.breakeven_trigger_roi, rc.trail_trigger_roi, rc.trail_gap_roi) == (0.5, 0.5, 0.1)
+    assert app.settings.rules_config("999").breakeven_trigger_roi == 0.2  # 其他领航员仍用全局
+    assert app.settings.rules_config("123").loss_tiers == tuple(float(t) for t in r["loss_tiers"])  # 之前采用的档位保留
     with pytest.raises(ValueError):
         recommend.adopt(store, app.settings, "123", "nope")
 
@@ -141,3 +153,28 @@ def test_web_detail_adopt_and_discover(web, monkeypatch):  # noqa: F811
     assert s == 200 and [x["id"] for x in d["items"]] == ["123"] and d["items"][0]["kind"] == "watch"
     s, d = c.call("GET", "/api/discover?range=90D&sort=MDD")
     assert calls == [1]  # 不足一页就不再翻；10 分钟内用缓存
+
+
+
+def test_profit_guard_rules():
+    g = {"label": "x", "params": {"stop_roi": None, "be_trigger": 0.3, "trail_gap": None, "trail_trigger": None}}
+    bt = {"baseline": {"total": 1.0, "max_dd": 2}, "oos": {"train_best": g, "full_best": {**g, "total": 1.5, "max_dd": 1,
+          "winners_cut": 3}, "test_best": {**g, "total": 0.2}, "test_baseline": {"total": 0.5}}}
+    assert recommend._profit_guard(bt)["adoptable"] is False  # 样本外不如原始跟单
+    bt["oos"]["test_best"]["total"] = 0.6
+    assert recommend._profit_guard(bt)["adoptable"] is True
+    g["params"]["stop_roi"] = -0.3  # 带单仓硬止损：只展示，不一键采用
+    assert recommend._profit_guard(bt)["adoptable"] is False and recommend._profit_guard(bt)["has_stop"]
+    g["params"].update(be_trigger=None)  # 只设止损：不算盈利保护
+    assert recommend._profit_guard(bt) is None
+    assert recommend._profit_guard({"baseline": {"total": 1}}) is None
+
+
+def test_summary_json_has_params_and_outdated_detection():
+    from bian import jobs
+    from bian.backtest import RuleParams, summarize
+    s = summarize(RuleParams(be_trigger=0.3, trail_gap=0.1), [])
+    j = jobs._summary_json(s)
+    assert j["params"] == {"stop_roi": None, "be_trigger": 0.3, "be_lock": 0.02, "trail_gap": 0.1, "trail_trigger": 0.3}
+    assert jobs.is_outdated({"ladder": None, "mdd_90d": None, "backtest": {"oos": {"train_best": j}}})
+    assert not jobs.is_outdated({"ladder": None, "mdd_90d": None, "backtest": {"oos": {"train_best": j, "full_best": j}}})

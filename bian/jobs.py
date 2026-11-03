@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from .analysis import KlineCache
 from .api.market import INTERVAL_MS, pick_interval
 from .api import leaders as leaders_api
-from .backtest import Costs, Summary, build_path, grid_search, ladder_search
+from .backtest import Costs, Summary, build_path, grid_search, ladder_search, run
 from .client import BinanceError, Client
 from .models import ClosedPosition
 from .profile import profile
@@ -140,7 +140,10 @@ def _set_path(store, lead_id: str, pid: str, mae, mfe, interval: str) -> None:
 def _summary_json(s: Summary | None) -> dict | None:
     if s is None:
         return None
-    return {"label": s.params.label(), "n": s.n, "total": s.total, "win_rate": s.win_rate,
+    p = s.params
+    params = {"stop_roi": p.stop_roi, "be_trigger": p.be_trigger, "be_lock": p.be_lock, "trail_gap": p.trail_gap,
+              "trail_trigger": p._trail_trigger() if p.trail_gap is not None else None}
+    return {"label": p.label(), "params": params, "n": s.n, "total": s.total, "win_rate": s.win_rate,
             "profit_factor": None if s.profit_factor == float("inf") else s.profit_factor, "worst": s.worst,
             "max_dd": s.max_dd, "rule_exits": s.rule_exits, "winners_cut": s.winners_cut,
             "profit_given_up": s.profit_given_up, "loss_saved": s.loss_saved}
@@ -184,7 +187,9 @@ def compute_profile(store, lead_id: str, kline_client: Client, cache_dir: str = 
         bt = {"baseline": _summary_json(rep.baseline), "stop_only": [_summary_json(x) for x in rep.stop_only],
               "ranked": [_summary_json(x) for x in rep.ranked[:10]],
               "oos": {"train_best": _summary_json(rep.train_best), "test_baseline": _summary_json(rep.test_baseline),
-                      "test_best": _summary_json(rep.test_best), "n_train": rep.n_train, "n_test": rep.n_test}}
+                      "test_best": _summary_json(rep.test_best), "n_train": rep.n_train, "n_test": rep.n_test,
+                      # 样本外选出的方案在全部历史上的表现（推荐“盈利保护”时和原始跟单对比）
+                      "full_best": _summary_json(run(paths, rep.train_best.params, Costs())) if rep.train_best else None}}
     ladder = ladder_search(paths, prof.get("winner_mfe_p50") or 0.0, prof.get("winner_mfe_p75") or 0.0) \
         if prof.get("path_n") else None
     data = {"profile": prof, "backtest": bt, "ladder": ladder, "mdd_90d": mdd,
@@ -216,4 +221,6 @@ def needs_refresh(store, lead_id: str) -> bool:
 
 
 def is_outdated(data: dict) -> bool:
-    return "ladder" not in data or "mdd_90d" not in data
+    """旧版本的分析结果：缺少止盈阶梯回测 / 最大回撤 / 回测方案参数（盈利保护推荐要用）。"""
+    oos = (data.get("backtest") or {}).get("oos") or {}
+    return "ladder" not in data or "mdd_90d" not in data or (bool(oos.get("train_best")) and "full_best" not in oos)

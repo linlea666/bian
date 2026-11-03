@@ -5,8 +5,10 @@
    含义：大多数最终盈利的单子不会跌到这个深度，提醒响了说明这一单比他通常扛的更深。
 2. 硬止损参考：回测“只设止损”里累计收益最好的那一档，附误杀的盈利单数。
 3. 跟单总止损比例：他近 90 天最大回撤 × 1.2（10%–50%），正常波动不触发、失控时兜底。
-4. 分批止盈阶梯：只有在“样本外”也比不止盈好时才推荐（见 backtest.ladder_search）。
-5. 我的实盘：在他身上提前离场 ≥5 次时，给一句“白止损多 / 挽回多”的说明（不参与计算）。
+4. 盈利保护（浮盈到位后保本 / 从最高浮盈回落止盈）：取回测全组合里用前 70% 选出的方案，
+   只有它在后 30%（没参与挑选）和全部历史上都比原始跟单好、且不带单仓硬止损时才推荐。
+5. 分批止盈阶梯：只有在“样本外”也比不止盈好时才推荐（见 backtest.ladder_search）。
+6. 我的实盘：在他身上提前离场 ≥5 次时，给一句“白止损多 / 挽回多”的说明（不参与计算）。
 样本少于 30 笔（或算出浮亏 / 浮盈的少于 30 笔）只展示数据，不给推荐。
 """
 from __future__ import annotations
@@ -46,6 +48,8 @@ def recommend(store, settings, lead_id: str) -> dict:
                  "outdated": bool(prof) and jobs.is_outdated(prof),  # 旧版本分析结果：后台会自动重新分析
                  "current": {"loss_tiers": list(cur.loss_tiers), "loss_tiers_mode": cur.loss_tiers_mode,
                              "recommend_total_stop_pct": cur.recommend_total_stop_pct,
+                             "breakeven_trigger_roi": cur.breakeven_trigger_roi, "trail_trigger_roi": cur.trail_trigger_roi,
+                             "trail_gap_roi": cur.trail_gap_roi,
                              "tp_ladder": [list(x) for x in cur.tp_ladder]}}
     if not prof:
         out["reason"] = "还没有分析结果，等后台分析完成后再看"
@@ -65,6 +69,7 @@ def recommend(store, settings, lead_id: str) -> dict:
     if stops and bt.get("baseline"):
         best = max(stops, key=lambda x: x["total"])
         out["hard_stop"] = {**best, "baseline_total": bt["baseline"]["total"], "better": best["total"] > bt["baseline"]["total"]}
+    out["profit_guard"] = _profit_guard(bt)
     mdd = prof.get("mdd_90d")
     if mdd:
         out["mdd_90d"] = mdd
@@ -84,6 +89,25 @@ def recommend(store, settings, lead_id: str) -> dict:
     return out
 
 
+def _profit_guard(bt: dict) -> dict | None:
+    """回测全组合里“前 70% 选出、后 30% 检验”的方案，作为盈利保护推荐（只有带保本 / 回撤止盈的方案才算）。"""
+    oos, base = bt.get("oos") or {}, bt.get("baseline")
+    tb, full, test, test_base = oos.get("train_best"), oos.get("full_best"), oos.get("test_best"), oos.get("test_baseline")
+    if not (tb and full and test and test_base and base and tb.get("params")):
+        return None
+    p = tb["params"]
+    if p.get("be_trigger") is None and p.get("trail_gap") is None:
+        return None  # 选出来的是只设止损 / 原始跟单：没有盈利保护可推荐
+    better = full["total"] > base["total"] and test["total"] > test_base["total"]
+    has_stop = p.get("stop_roi") is not None
+    return {"label": tb["label"], "params": p, "total": full["total"], "baseline_total": base["total"],
+            "max_dd": full["max_dd"], "baseline_dd": base["max_dd"], "winners_cut": full["winners_cut"],
+            "test_total": test["total"], "test_baseline": test_base["total"], "n_train": oos.get("n_train"),
+            "n_test": oos.get("n_test"), "better": better, "has_stop": has_stop,
+            # 带单仓硬止损的不给一键采用：止损要在币安设置，且和“亏损只提醒”的建议冲突
+            "adoptable": better and not has_stop}
+
+
 def adopt(store, settings, lead_id: str, what: str) -> dict:
     """采用推荐：写入该领航员的单独设置（复用 leader_rules 覆盖机制和校验）。what：stops / ladder / clear_ladder。"""
     rec = recommend(store, settings, lead_id)
@@ -97,6 +121,16 @@ def adopt(store, settings, lead_id: str, what: str) -> dict:
             rules["recommend_total_stop_pct"] = rec["total_stop_pct"]
         desc = f"亏损档位 {', '.join(f'-{t}%' for t in rec['loss_tiers'])}" + (
             f"，总止损建议 = 净投入 × {rec['total_stop_pct']:.0%}" if rec.get("total_stop_pct") else "")
+    elif what == "profit":
+        pg = rec.get("profit_guard") if rec["ok"] else None
+        if not pg or not pg["adoptable"]:
+            raise ValueError("这个领航员没有通过样本外检验的盈利保护方案，暂不推荐")
+        p = pg["params"]
+        if p.get("be_trigger") is not None:
+            rules["breakeven_trigger_roi"] = p["be_trigger"]
+        if p.get("trail_gap") is not None:
+            rules.update(trail_trigger_roi=p["trail_trigger"], trail_gap_roi=p["trail_gap"])
+        desc = "盈利保护 " + pg["label"]
     elif what == "ladder":
         if not rec.get("ladder"):
             raise ValueError("这个领航员没有通过样本外检验的止盈阶梯，暂不推荐")
