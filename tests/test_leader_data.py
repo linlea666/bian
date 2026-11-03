@@ -41,8 +41,10 @@ def test_monitor_marks_relation_ended_while_service_was_down():
     store = Store(":memory:")
     ensure_leader(store, "OLD", "老领航员", "copy")
     mon = Monitor(AppConfig(leaders=[LeaderConfig(portfolio_id="X")]), None, None, store)
-    mon._sync_relations([], now=1000)
-    assert kind(store, "OLD") == ("ended", 1000)
+    for t in (1000, 1300, 1601):  # 整个列表为空：要连续 3 次且持续 10 分钟才确认
+        mon._sync_relations([], now=t)
+        assert kind(store, "OLD")[0] == ("copy" if t < 1601 else "ended")
+    assert kind(store, "OLD") == ("ended", 1601)
     (title,) = [r[0] for r in store.db.execute("SELECT title FROM events WHERE type='leader.ended'")]
     assert "老领航员" in title and "保留" in title
 
@@ -112,3 +114,70 @@ def test_web_export_and_delete(web):  # noqa: F811
     assert s == 200 and d["backup"].startswith("leader-111-")
     s, d = c.call("GET", "/api/leaders/detail?id=111")
     assert s == 404
+
+
+
+# ---------------------------------------------------------------- 停止跟单的确认保护
+from bian.lifecycle import EpisodeRecorder  # noqa: E402
+from bian.models import Position  # noqa: E402
+from bian.monitor import LeaderRuntime  # noqa: E402
+from bian.rules import RuleConfig  # noqa: E402
+
+
+def copy_monitor(*pids):
+    store = Store(":memory:")
+    mon = Monitor(AppConfig(), None, None, store, recorder=EpisodeRecorder(store))
+    for pid in pids:
+        ensure_leader(store, pid, f"名字{pid}", "copy")
+        mon.leaders.append(LeaderRuntime(LeaderConfig(portfolio_id=pid, source="copy"), RuleConfig(), source="copy",
+                                         copy_portfolio_id="C" + pid, name=f"名字{pid}"))
+    return store, mon
+
+
+def rel(pid):
+    return {"leadPortfolioId": pid, "copyPortfolioId": "C" + pid, "nickname": f"名字{pid}"}
+
+
+def test_one_glitch_does_not_end_relation():
+    store, mon = copy_monitor("A", "B")
+    mon._sync_relations([rel("A")], now=0)  # 一次少了 B
+    mon._sync_relations([rel("A"), rel("B")], now=20)  # 又出现了
+    for t in (40, 60):
+        mon._sync_relations([rel("A")], now=t)  # 重新计数：只有 2 次
+    assert kind(store, "B")[0] == "copy" and len(mon.leaders) == 2
+    assert not store.db.execute("SELECT COUNT(*) FROM events WHERE type IN ('leader.removed','leader.ended')").fetchone()[0]
+
+
+def test_relation_ends_after_three_reads_and_two_minutes():
+    store, mon = copy_monitor("A", "B")
+    for t in (0, 20, 40):
+        mon._sync_relations([rel("A")], now=t)
+    assert kind(store, "B")[0] == "copy"  # 3 次了，但还不到 2 分钟
+    mon._sync_relations([rel("A")], now=121)
+    assert kind(store, "B")[0] == "ended" and [lr.cfg.portfolio_id for lr in mon.leaders] == ["A"]
+    assert store.db.execute("SELECT COUNT(*) FROM events WHERE type='leader.removed'").fetchone()[0] == 1
+
+
+def test_positions_still_visible_means_relation_alive():
+    store, mon = copy_monitor("A", "B")
+    lr_b = mon.leaders[1]
+    p = Position("B", "ETHUSDT", "LONG", 1, 100, 100, 10, 0, "copy")
+    lr_b.positions = {p.key: p}
+    for t in range(0, 700, 20):
+        lr_b.last_ok = t  # 每轮都还能查到他的跟单仓位
+        mon._sync_relations([rel("A")], now=t)
+    assert kind(store, "B")[0] == "copy" and len(mon.leaders) == 2
+    lr_b.positions = {}  # 仓位没了，列表里也一直没有 → 确认停止
+    mon._sync_relations([rel("A")], now=720)
+    assert kind(store, "B")[0] == "ended"
+
+
+def test_empty_list_needs_ten_minutes_and_does_not_close_episodes_early():
+    store, mon = copy_monitor("A")
+    mon.recorder.observe("A", "名字A", [Position("A", "ETHUSDT", "LONG", 1, 100, 100, 10, 0, "copy")], now=0)
+    for t in (20, 40, 60, 200, 400):
+        mon._sync_relations([], now=t)
+    assert kind(store, "A")[0] == "copy"
+    assert store.db.execute("SELECT status FROM episodes").fetchone()[0] == "open"  # 回合没有被提前结束
+    mon._sync_relations([], now=620)
+    assert kind(store, "A")[0] == "ended" and store.db.execute("SELECT status FROM episodes").fetchone()[0] == "closed"

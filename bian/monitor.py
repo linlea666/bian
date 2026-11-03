@@ -46,6 +46,10 @@ class LeaderRuntime:
 
 class Monitor:
     EQUITY_EVERY_S = 300
+    # 跟单列表里少了某个领航员，要确认后才算“已停止跟单”（防止接口偶尔返回不全 / 空列表造成误判）
+    ABSENT_CONFIRM_N = 3  # 连续 3 次成功读取都不在列表里
+    ABSENT_CONFIRM_S = 120  # 且至少持续 2 分钟
+    EMPTY_CONFIRM_S = 600  # 整个列表突然变空：至少持续 10 分钟
 
     def __init__(self, cfg: AppConfig, client: Client, notifier: Notifier, store: Store, clock=time.time,
                  guard=None, recorder=None, rules_provider=None):
@@ -65,6 +69,7 @@ class Monitor:
             k: AccountState.from_dict(v) for k, v in saved.items() if k.startswith("acct:")
         }
         self.portfolio = PortfolioState()
+        self.absent: dict[str, dict] = {}  # 领航员 ID -> {"since": 首次不在列表的时间, "n": 连续次数}
         self.outbox: list[Outgoing] = []
         self.auth_alerted = False
         self.leaders = [LeaderRuntime(c, self.rules_provider(c.portfolio_id)) for c in cfg.leaders]
@@ -227,15 +232,41 @@ class Monitor:
         """运行中发现新跟单 / 结束跟单：自动加入或移除监控（只针对自动发现的领航员）；
         并更新领航员的“跟单中 / 已停止跟单”状态（停止后数据默认保留，可在领航员页导出或删除）。"""
         live = {str(r.get("leadPortfolioId")): r for r in rels}
-        ended = set(mark_copy_set(self.store, live, now))
-        removed = self._discover(live, now) if self.cfg.auto_discover else set()
+        keep = self._still_copying(live, now)  # 列表里的 + 还在确认期内的
+        ended = set(mark_copy_set(self.store, keep, now))
+        removed = self._discover(live, keep, now) if self.cfg.auto_discover else set()
         for pid in sorted(ended - removed):  # 例如服务停机期间停止的跟单（监控里已经没有它）
             row = self.store.db.execute("SELECT name FROM leaders WHERE lead_id=?", (pid,)).fetchone()
             self.store.log_event("leader.ended", f"已停止跟单：{(row and row[0]) or pid}（数据继续保留，"
                                  "可在领航员页导出或删除）", leader_id=pid, ts=now)
 
-    def _discover(self, live: dict, now: float) -> set:
-        """自动加入新跟单、移除已结束的跟单。返回本次移除的领航员 ID。"""
+    def _still_copying(self, live: dict, now: float) -> set[str]:
+        """哪些领航员仍按“跟单中”处理：本次列表里有的，加上不在列表里但还没确认停止的。
+        确认停止需要：连续 ABSENT_CONFIRM_N 次成功读取都不在列表里，且持续 ABSENT_CONFIRM_S 秒
+        （整个列表为空时 EMPTY_CONFIRM_S 秒）；期间他的跟单仓位接口还能查到仓位，说明跟单关系还在，不算停止。
+        标记停止、移出监控、结束仓位回合都以这里的结果为准，三者保持一致。"""
+        known = {r[0] for r in self.store.db.execute("SELECT lead_id FROM leaders WHERE kind='copy'")}
+        known |= {lr.cfg.portfolio_id for lr in self.leaders if lr.source == "copy"}
+        for pid in live:
+            self.absent.pop(pid, None)
+        by_id = {lr.cfg.portfolio_id: lr for lr in self.leaders}
+        need_s = self.EMPTY_CONFIRM_S if not live else self.ABSENT_CONFIRM_S
+        keep = set(live)
+        for pid in sorted(known - set(live)):
+            a = self.absent.setdefault(pid, {"since": now, "n": 0})
+            a["n"] += 1
+            lr = by_id.get(pid)
+            has_positions = bool(lr and lr.positions and now - lr.last_ok <= 3 * self.cfg.poll_seconds)
+            if has_positions or a["n"] < self.ABSENT_CONFIRM_N or now - a["since"] < need_s:
+                if a["n"] == 1:
+                    print(f"跟单列表里暂时没有 {lr.name if lr else pid}，确认中（可能是接口返回不全）")
+                keep.add(pid)
+            else:
+                self.absent.pop(pid, None)
+        return keep
+
+    def _discover(self, live: dict, keep: set, now: float) -> set:
+        """自动加入新跟单、移除已确认结束的跟单。返回本次移除的领航员 ID。"""
         removed = set()
         configured = {lc.portfolio_id for lc in self.cfg.leaders}
         for pid, r in live.items():
@@ -249,7 +280,7 @@ class Monitor:
             self.store.log_event("leader.added", f"发现新的跟单：{name}，已加入监控", leader_id=pid, ts=now)
         for lr in list(self.leaders):
             pid = lr.cfg.portfolio_id
-            if lr.source == "copy" and pid not in live and pid not in configured:
+            if lr.source == "copy" and pid not in keep and pid not in configured:
                 self.leaders.remove(lr)
                 if self.recorder:
                     self.recorder.close_leader(pid, lr.name, now)
