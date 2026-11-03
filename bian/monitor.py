@@ -17,6 +17,13 @@ from .rules import (
 from .store import Store
 
 LEAD_URL = "https://www.binance.com/zh-CN/copy-trading/lead-details/{}"
+
+
+def _float(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 FOOTER = "（建议仅供参考：本系统不会自动下单/止损，请在币安页面自行操作）"
 
 
@@ -203,7 +210,8 @@ class Monitor:
             out += [self._send(a, lr) for a in alerts]
             if now - self.last_equity_ts.get(snap.lead_id, 0) >= self.EQUITY_EVERY_S:
                 self.last_equity_ts[snap.lead_id] = now
-                self.store.add_equity(now, snap.lead_id, snap.equity, snap.invested, snap.unrealized, snap.realized)
+                self.store.add_equity(now, snap.lead_id, snap.equity, snap.invested, snap.unrealized, snap.realized,
+                                      _float(r.get("profitSharedAmount")))
             dd = (st.peak_equity - snap.equity) / st.peak_equity if st.peak_equity > 0 else 0.0
             accounts_view.append({
                 **asdict(snap), "name": lr.name, "peak_equity": st.peak_equity, "drawdown": dd,
@@ -233,6 +241,8 @@ class Monitor:
             pid = lr.cfg.portfolio_id
             if lr.source == "copy" and pid not in live and pid not in configured:
                 self.leaders.remove(lr)
+                if self.recorder:
+                    self.recorder.close_leader(pid, lr.name, now)
                 self.store.log_event("leader.removed", f"跟单已结束：{lr.name}，停止监控", leader_id=pid, ts=now)
 
     def _process(self, lr: LeaderRuntime, positions: list[Position], now: float) -> list[Alert]:
@@ -275,11 +285,23 @@ class Monitor:
         summary: list[str] = []
         if not lr.initialized:
             self._drop_stale_states(current, now)
+        residuals = (self.store.get_runtime("residuals", {})[0] or {}) if lr.source == "copy" else {}
         for key, pos in current.items():
             known = key in self.states
             st, alerts = evaluate(pos, self.states.get(key), lr.rules, now, self._margin_u(lr, pos))
             self.states[key] = st
             self.store.save_state(key, st.to_dict())
+            # R12 残留仓位：领航员已经平仓，我的跟单仓位还在（后台对比领航员历史得出），每个回合只提醒一次
+            legs = [pos.key] if not pos.is_hedge else [f"{prefix}{pos.symbol}:LONG", f"{prefix}{pos.symbol}:SHORT"]
+            res = next((residuals[k] for k in legs if k in residuals), None)
+            if res and st.fired.get("R12", {}).get("ref") != res["episode_id"]:
+                st.fired["R12"] = {"version": st.version, "ts": now, "armed": False, "ref": res["episode_id"]}
+                self.store.save_state(key, st.to_dict())
+                alerts.append(Alert(
+                    "R12", "warn", key, st.version, "残留仓位：领航员已经平仓，你的跟单仓位还在",
+                    f"领航员平仓时间 {time.strftime('%m-%d %H:%M', time.localtime(res['leader_close_ms'] / 1000))}，"
+                    f"平仓均价约 {res['leader_close_price']:.6g}",
+                    "币安不会再替你平这个仓位，请在币安手动平仓（或确认你是有意继续持有）", now))
             if not known and pos.symbol in prev_symbols:
                 # 同币种从单边变成对冲（或反过来）：不当作新开仓
                 alerts = [a for a in alerts if a.rule_id != "R00"]

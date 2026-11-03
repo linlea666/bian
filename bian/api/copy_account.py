@@ -53,9 +53,10 @@ def copy_positions(client: Client, copy_portfolio_id: str, lead_portfolio_id: st
     return out
 
 
-def _paged(client: Client, path: str, copy_portfolio_id: str, max_pages: int, page_size: int) -> list[dict]:
-    """实测：分页参数是 pageNumber/pageSize（page/rows 会被忽略、固定返回 10 条）。"""
-    out: list[dict] = []
+def iter_pages(client: Client, path: str, copy_portfolio_id: str, page_size: int = 50, max_pages: int = 20):
+    """逐页返回私有历史接口的记录（最新的在前）。调用方可以在看到已同步的记录时提前停止。
+    实测：分页参数是 pageNumber/pageSize（page/rows 会被忽略、固定返回 10 条）。"""
+    got = 0
     for page in range(1, max_pages + 1):
         d = client.post(
             PRIV + path,
@@ -63,9 +64,16 @@ def _paged(client: Client, path: str, copy_portfolio_id: str, max_pages: int, pa
             private=True,
         ) or {}
         rows = d.get("list") or []
+        got += len(rows)
+        yield rows
+        if len(rows) < page_size or got >= int(d.get("total") or 0):
+            return
+
+
+def _paged(client: Client, path: str, copy_portfolio_id: str, max_pages: int, page_size: int) -> list[dict]:
+    out: list[dict] = []
+    for rows in iter_pages(client, path, copy_portfolio_id, page_size, max_pages):
         out += rows
-        if len(rows) < page_size or len(out) >= int(d.get("total") or 0):
-            break
     return out
 
 

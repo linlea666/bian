@@ -17,6 +17,7 @@ COLS = ("id", "pos_key", "leader_id", "leader_name", "symbol", "side", "source",
 
 GIVEBACK_MIN_MFE = 0.30  # 最大浮盈至少 +30% ROI 才评估“利润回吐 / 盈转亏”
 QTY_EPS = 0.01
+POINT_EVERY_S = 300  # 时间线采样间隔
 
 
 def ensure_schema(db) -> None:
@@ -51,6 +52,8 @@ class EpisodeRecorder:
         for row in store.db.execute(f"SELECT {', '.join(COLS)} FROM episodes WHERE status='open'"):
             ep = dict(zip(COLS, row))
             self.open[ep["pos_key"]] = ep
+        self.last_point: dict[int, float] = {
+            r[0]: r[1] for r in store.db.execute("SELECT episode_id, MAX(ts) FROM episode_points GROUP BY episode_id")}
 
     # ------------------------------------------------------------ 写库
     def _insert(self, ep: dict) -> int:
@@ -104,6 +107,7 @@ class EpisodeRecorder:
         }
         ep["id"] = self._insert(ep)
         self.open[p.key] = ep
+        self._point(ep, p, now, force=True)
         side = "多" if p.side == "LONG" else "空"
         self.store.log_event("position.open", f"[{leader_name}] {p.symbol} {side} 开仓", leader_id=leader_id,
                              episode_id=ep["id"], ts=now, entry=p.entry_price, qty=p.qty, leverage=p.leverage,
@@ -129,6 +133,8 @@ class EpisodeRecorder:
                                  + ("（盈利中减仓）" if in_profit else ""),
                                  leader_id=ep["leader_id"], episode_id=ep["id"], ts=now, qty_from=last_qty,
                                  qty_to=p.qty, roi=round(roi, 4), in_profit=in_profit)
+            self._record_exit(ep, now, last_qty - p.qty, partial=True, mark=p.mark_price, roi=roi,
+                              exit_type="待判定")
         if roi < (ep["mae_roi"] or 0):
             ep["mae_roi"], ep["mae_u"], ep["mae_ts"] = roi, self._money(p, roi), now
         if roi > (ep["mfe_roi"] or 0):
@@ -138,8 +144,15 @@ class EpisodeRecorder:
                   last_roi=roi, last_u=p.unrealized_pnl if p.source == "copy" else None, last_mark=p.mark_price,
                   last_seen=now, leader_name=leader_name)
         self._save(ep)
+        self._point(ep, p, now)
 
     def _close(self, ep: dict, now: float, exit_type: str, leader_name: str) -> None:
+        if ep.get("last_qty"):
+            # 停机期间结束的：实际平仓时间在 last_seen ~ now 之间，后台按成交记录确定
+            ts = ep.get("last_seen") or now if exit_type == "停机期间结束" else now
+            self._record_exit(ep, ts, ep["last_qty"], partial=False, mark=ep.get("last_mark"),
+                              roi=ep.get("last_roi"), exit_type="跟单结束" if exit_type == "跟单结束" else "待判定",
+                              created=now)
         ep.update(status="closed", closed_ts=now, exit_type=exit_type)
         tags = labels(ep)
         ep["note"] = "、".join(tags)
@@ -156,6 +169,32 @@ class EpisodeRecorder:
             hold_hours=round((now - ep["opened_ts"]) / 3600, 2), mae_roi=ep["mae_roi"], mae_u=ep["mae_u"],
             mfe_roi=ep["mfe_roi"], mfe_u=ep["mfe_u"], last_roi=ep["last_roi"], last_u=ep["last_u"],
             adds=ep["adds"], reduces=ep["reduces"], max_tier=ep["max_tier"], labels=tags)
+
+    def _point(self, ep: dict, p: Position, now: float, force: bool = False) -> None:
+        if not force and now - self.last_point.get(ep["id"], 0) < POINT_EVERY_S:
+            return
+        self.last_point[ep["id"]] = now
+        self.store.db.execute("INSERT INTO episode_points (episode_id, ts, roi, u, mark) VALUES (?,?,?,?,?)",
+                              (ep["id"], now, p.roi, p.unrealized_pnl if p.source == "copy" else None, p.mark_price))
+
+    def _record_exit(self, ep: dict, now: float, qty: float, partial: bool, mark, roi, exit_type: str,
+                     created: float | None = None) -> None:
+        """我的跟单仓位减仓 / 平仓：写一条待判定的离场记录，由后台对比领航员后定性并做反事实。
+        只针对我自己的跟单仓位（source=copy）；领航员公开持仓不是我的钱，不记。"""
+        if ep.get("source") != "copy" or qty <= 0:
+            return
+        self.store.db.execute(
+            "INSERT INTO exits (episode_id, lead_id, leader_name, symbol, side, ts, qty, entry, price, partial, roi, "
+            "exit_type, remarks, status, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ep["id"], ep["leader_id"], ep["leader_name"], ep["symbol"], ep["side"], now, qty, ep.get("last_entry"),
+             mark, int(partial), roi, exit_type, "", "pending", created or now))
+
+    def close_leader(self, leader_id: str, leader_name: str, now: float | None = None) -> None:
+        """跟单关系结束：该跟单下仍未结束的回合以“跟单结束”收尾。"""
+        now = now or self.clock()
+        for key in [k for k, e in self.open.items() if e["leader_id"] == leader_id]:
+            self._close(self.open[key], now, "跟单结束", leader_name)
+        self.store.db.commit()
 
     # ------------------------------------------------------------ 提醒关联
     def note_alert(self, leader_id: str, symbol: str, rule_id: str, alert_id: int | None = None) -> list[int]:
@@ -192,3 +231,13 @@ def episodes(store, status: str | None = None, leader_id: str | None = None, lim
         ep["labels"] = labels(ep) if ep["status"] == "closed" else []
         out.append(ep)
     return out
+
+
+def get_episode(store, episode_id: int) -> dict | None:
+    ensure_schema(store.db)
+    row = store.db.execute(f"SELECT {', '.join(COLS)} FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    if not row:
+        return None
+    ep = dict(zip(COLS, row))
+    ep["labels"] = labels(ep) if ep["status"] == "closed" else []
+    return ep

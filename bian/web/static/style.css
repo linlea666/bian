@@ -93,6 +93,8 @@ h3 { font-size: 15px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px; }
 .card + .card, .section + .section { margin-top: 14px; }
 .grid > .card { margin-top: 0; }
+h3.section { margin: 20px 0 10px; font-size: 15px; }
+.grid + .section, .grid + .card { margin-top: 14px; }
 .card-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
 .grid { display: grid; gap: 12px; }
 .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); }
@@ -218,4 +220,38 @@ tr.sub td { background: var(--panel-2); font-size: 12px; }
   table.cards tr { display: block; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; padding: 6px 4px; }
   table.cards td { display: flex; justify-content: space-between; gap: 8px; border: 0; padding: 4px 8px; text-align: right; }
   table.cards td::before { content: attr(data-l); color: var(--muted); text-align: left; }
+}
+
+/* ---------- 第二期 ---------- */
+.grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+hr.sep { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+.kv-wide { max-width: 760px; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.cal-head, .cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cal-head div { text-align: center; color: var(--muted); font-size: 12px; padding: 4px 0; }
+.cal-cell { min-height: 62px; border-radius: 8px; background: var(--panel-2); padding: 6px; display: flex; flex-direction: column; justify-content: space-between; }
+.cal-cell.empty { background: transparent; }
+.cal-cell .d { font-size: 12px; color: var(--muted); }
+.cal-cell .v { font-size: 13px; font-weight: 600; text-align: right; }
+.cal-cell.pos { background: color-mix(in srgb, var(--green) calc(var(--a) * 100%), var(--panel-2)); }
+.cal-cell.neg { background: color-mix(in srgb, var(--red) calc(var(--a) * 100%), var(--panel-2)); }
+.cal-cell.pos .v, .cal-cell.neg .v { color: var(--text); }
+.chart.tall { height: 240px; }
+.chart .bar-up { fill: var(--green); } .chart .bar-dn { fill: var(--red); }
+.chart .pt-win { fill: var(--green); opacity: .75; } .chart .pt-loss { fill: var(--red); opacity: .75; }
+.chart .mk-pos { stroke: var(--blue); stroke-width: 1.5; opacity: .55; }
+.chart .mk-alert { stroke: var(--yellow); stroke-width: 1.5; opacity: .8; }
+.chart .mk-exit { stroke: var(--red); stroke-width: 2; opacity: .8; }
+.mk-pos-t { color: var(--blue); } .mk-alert-t { color: var(--yellow); } .mk-exit-t { color: var(--red); }
+.dist { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+th.sort { cursor: pointer; user-select: none; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--panel-2); }
+select.sm-sel { width: auto; padding: 3px 6px; font-size: 12px; }
+@media (max-width: 1100px) { .grid.two { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .nav { grid-template-columns: repeat(6, 1fr); }
+  .nav a { font-size: 10px; }
+  .cal-cell { min-height: 46px; padding: 3px; }
+  .cal-cell .v { font-size: 10px; }
 }

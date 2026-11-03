@@ -17,7 +17,9 @@ from urllib.parse import parse_qs, urlparse
 
 from .. import __version__
 from ..curl_parse import CurlParseError, parse_credentials
-from ..lifecycle import episodes
+from .. import exits as exits_mod, jobs as jobs_mod, stats as stats_mod
+from ..lifecycle import episodes, get_episode
+from ..sync import ensure_leader
 from ..notify import SmtpConfig, describe_smtp_error, smtp_send
 from ..settings import SettingsError, public_view
 from . import auth, views
@@ -293,6 +295,121 @@ def make_handler(app):
         app.store.log_event("todo.done", f"标记已处理：{b.get('title') or key}", ref=key, username=s["username"])
         return {"ok": True}
 
+    # ---------------------------------------------------------- 第二期
+    def stats(h, q, b, s):
+        now = time.time()
+        lt = time.localtime(now)
+        try:
+            y, m = (int(x) for x in str(q.get("month") or f"{lt.tm_year}-{lt.tm_mon}").split("-"))
+            if not (2000 <= y <= 2100 and 1 <= m <= 12):
+                raise ValueError
+        except ValueError:
+            raise ApiError(400, "月份格式应为 YYYY-MM") from None
+        synced = app.store.db.execute("SELECT COUNT(*), MIN(ts_ms) FROM fills").fetchone()
+        return {
+            "calendar": stats_mod.calendar_month(app.store, y, m),
+            "periods": stats_mod.periods(app.store, now),
+            "composition": stats_mod.composition(app.store, now),
+            "losses": stats_mod.losses(app.store),
+            "exits": exits_mod.summary(app.store, 0),
+            "exits_month": exits_mod.summary(app.store, stats_mod.period_starts(now)["month"]),
+            "giveback": stats_mod.giveback(app.store),
+            "sync": {"fills": synced[0], "since_ms": synced[1]},
+        }
+
+    def leaders_list(h, q, b, s):
+        return {"leaders": stats_mod.ranking(app.store)}
+
+    def _lead_id(q_or_b) -> str:
+        lid = str(q_or_b.get("id") or "").strip()
+        if not lid.isdigit() or len(lid) > 30:
+            raise ApiError(400, "领航员 ID 应为数字（领航员主页网址里 lead-details/ 后面那串数字）")
+        return lid
+
+    def leader_detail(h, q, b, s):
+        lid = _lead_id(q)
+        row = app.store.db.execute("SELECT name, kind, added, history_synced FROM leaders WHERE lead_id=?", (lid,)).fetchone()
+        if not row:
+            raise ApiError(404, "还没有这个领航员的数据")
+        rank = next((r for r in stats_mod.ranking(app.store) if r["lead_id"] == lid), None)
+        cur = app.store.db.execute(
+            "SELECT symbol, side, opened_ms, closed_ms, avg_cost, avg_close, leverage, pnl, roi, status FROM my_positions "
+            "WHERE lead_id=? ORDER BY opened_ms DESC LIMIT 50", (lid,))
+        cols = [c[0] for c in cur.description]
+        dist = app.store.db.execute(
+            "SELECT mae, mfe, pnl FROM leader_history WHERE lead_id=? AND mae IS NOT NULL", (lid,)).fetchall()
+        return {
+            "lead_id": lid, "name": row[0], "kind": row[1], "added": row[2], "history_synced": row[3],
+            "ranking": rank, "profile": jobs_mod.get_profile(app.store, lid), "job": jobs_mod.current_job(app.store, lid),
+            "my_positions": [dict(zip(cols, r)) for r in cur.fetchall()],
+            "exits": exits_mod.exits_list(app.store, 100, lid), "exits_summary": exits_mod.summary(app.store, 0, lid),
+            "mae_mfe": [{"mae": r[0], "mfe": r[1], "win": (r[2] or 0) > 0} for r in dist],
+            "link": views.LEAD_URL.format(lid),
+        }
+
+    def leader_analyze(h, q, b, s):
+        lid = _lead_id(b)
+        new = ensure_leader(app.store, lid, str(b.get("name") or lid), "watch")
+        queued = jobs_mod.enqueue(app.store, lid, "手动重新分析" if not new else "手动加入观察")
+        return {"ok": True, "queued": queued, "message": "已开始分析，几分钟到半小时完成（取决于历史仓位数量）"
+                if queued else "这个领航员已经在分析队列里了"}
+
+    def episode_detail(h, q, b, s):
+        try:
+            eid = int(q.get("id") or 0)
+        except ValueError:
+            raise ApiError(400, "参数错误") from None
+        ep = get_episode(app.store, eid)
+        if not ep:
+            raise ApiError(404, "找不到这个仓位回合")
+        pts = app.store.db.execute("SELECT ts, roi, u, mark FROM episode_points WHERE episode_id=? ORDER BY ts",
+                                   (eid,)).fetchall()
+        exs = [x for x in exits_mod.exits_list(app.store, 1000, ep["leader_id"]) if x["episode_id"] == eid]
+        lp = exits_mod.leader_match(app.store, ep["leader_id"], ep["symbol"], ep["side"], ep["opened_ts"])
+        return {"episode": ep, "points": [{"ts": p[0], "roi": p[1], "u": p[2], "mark": p[3]} for p in pts],
+                "events": app.store.events(limit=300, episode_id=eid), "exits": exs,
+                "leader_position": lp.__dict__ if lp else None, "link": views.LEAD_URL.format(ep["leader_id"])}
+
+    def exits_list(h, q, b, s):
+        return {"exits": exits_mod.exits_list(app.store, int(q.get("limit") or 200), q.get("leader") or None)}
+
+    def exit_manual(h, q, b, s):
+        try:
+            exits_mod.set_manual(app.store, int(b.get("id") or 0), str(b.get("exit_type") or ""))
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        return {"ok": True}
+
+    def events_export(h, q, b, s):
+        import csv
+        import io
+
+        rows = app.store.events(
+            limit=10000, type_prefix=q.get("type") or None, leader_id=q.get("leader") or None,
+            episode_id=int(q["episode"]) if q.get("episode") else None, level=q.get("level") or None,
+            q=q.get("q") or None)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        if q.get("format") == "json":
+            body = json.dumps(rows, ensure_ascii=False, indent=1, default=str).encode()
+            h._send(200, body, "application/json; charset=utf-8",
+                    {"Cache-Control": "no-store", "Content-Disposition": f'attachment; filename="bian-events-{stamp}.json"'})
+            return None
+        def cell(v) -> str:
+            v = str(v)
+            return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v  # 防止 Excel 把内容当公式执行
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["时间", "类型", "级别", "领航员", "回合", "标题", "详情"])
+        for r in rows:
+            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"])), r["type"], r["level"],
+                        r["leader_id"] or "", r["episode_id"] or "", cell(r["title"]),
+                        cell(json.dumps(r["detail"], ensure_ascii=False)) if r["detail"] else ""])
+        body = ("\ufeff" + buf.getvalue()).encode()  # 带 BOM，Excel 直接打开不乱码
+        h._send(200, body, "text/csv; charset=utf-8",
+                {"Cache-Control": "no-store", "Content-Disposition": f'attachment; filename="bian-events-{stamp}.csv"'})
+        return None
+
     def onboarding_done(h, q, b, s):
         app.settings.update({"onboarding_done": True})
         app.store.log_event("settings.onboarding", "完成首次引导", username=s["username"])
@@ -317,6 +434,14 @@ def make_handler(app):
         ("POST", "/api/email/test"): (test_email, True),
         ("POST", "/api/todos/done"): (todo_done, True),
         ("POST", "/api/onboarding/done"): (onboarding_done, True),
+        ("GET", "/api/stats"): (stats, True),
+        ("GET", "/api/leaders"): (leaders_list, True),
+        ("GET", "/api/leaders/detail"): (leader_detail, True),
+        ("POST", "/api/leaders/analyze"): (leader_analyze, True),
+        ("GET", "/api/episode"): (episode_detail, True),
+        ("GET", "/api/exits"): (exits_list, True),
+        ("POST", "/api/exits/manual"): (exit_manual, True),
+        ("GET", "/api/events/export"): (events_export, True),
     }
     Handler.status = HTTPStatus
     return Handler

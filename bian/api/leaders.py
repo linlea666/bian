@@ -134,21 +134,27 @@ def parse_closed(x: dict, leader_id: str) -> ClosedPosition:
     )
 
 
-def position_history(
-    client: Client, portfolio_id: str, max_pages: int = 20, page_size: int = 100
-) -> list[ClosedPosition]:
-    """领航员全部已平仓位（只保留 status=All Closed），按开仓时间升序。"""
-    out: list[ClosedPosition] = []
+def iter_position_history_pages(client: Client, portfolio_id: str, page_size: int = 100, max_pages: int = 20):
+    """逐页返回领航员已平仓历史的原始记录（最新的在前，包含 Partially Closed）。"""
     for page in range(1, max_pages + 1):
         data = client.post(
             P + "/lead-portfolio/position-history",
             {"pageNumber": page, "pageSize": page_size, "portfolioId": portfolio_id},
         ) or {}
         rows = data.get("list") or []
+        yield rows
+        if len(rows) < page_size or page * page_size >= int(data.get("total") or 0):
+            return
+
+
+def position_history(
+    client: Client, portfolio_id: str, max_pages: int = 20, page_size: int = 100
+) -> list[ClosedPosition]:
+    """领航员全部已平仓位（只保留 status=All Closed），按开仓时间升序。"""
+    out: list[ClosedPosition] = []
+    for rows in iter_position_history_pages(client, portfolio_id, page_size, max_pages):
         for x in rows:
             if str(x.get("status")) == "All Closed" and x.get("closed"):
                 out.append(parse_closed(x, portfolio_id))
-        if len(rows) < page_size or page * page_size >= int(data.get("total") or 0):
-            break
     out.sort(key=lambda c: c.opened)
     return out

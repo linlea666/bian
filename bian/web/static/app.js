@@ -1,7 +1,9 @@
 /* bian 风控作战室 —— 单页应用（原生 JS，无需构建） */
 "use strict";
 
-const S = { me: null, settings: null, page: "", timer: null, events: [], alerts: [] };
+// gen：路由代次。每次切换页面 +1；异步请求返回后代次不一致就丢弃结果，定时器也只属于创建它的那一代
+const S = { me: null, settings: null, page: "", timer: null, gen: 0, events: [], alerts: [], evFilter: null };
+const stale = (gen) => gen !== S.gen;
 const root = document.getElementById("root");
 
 /* ---------------- 术语解释（小白模式） ---------------- */
@@ -22,6 +24,12 @@ const HELP = {
   breakeven: "保本提醒：浮盈达到这个比例时，提醒你把止损上移到开仓价附近，保住不亏。",
   trail: "回撤止盈提醒：浮盈从最高点回落这么多个百分点时，提醒你部分止盈。",
   cred: "币安网页登录凭证（p20t + csrftoken），用来读取你的跟单仓位。通常 7–30 天会失效，失效后系统会发邮件提醒你更新。",
+  early: "提前离场：你的仓位平掉了，但领航员同一个仓位当时还没平（手动平仓、你设的止损止盈单、总止损都算）。系统会继续盯着领航员，等他平仓后算出你这次离场是“挽回了”还是“白止损”。",
+  verdict: "止损挽回：领航员后来亏得更多；白止损：领航员扛回来了或亏得更少；避免回吐：你盈利离场后领航员利润回吐了；少赚：你盈利离场后领航员继续涨。金额 = 你的实际结果 − 跟到底的结果（含手续费）。",
+  realized: "已实现净盈亏：平仓赚亏 + 手续费，来自你的逐笔成交记录（包含跟单开始以来的历史）。",
+  equity_change: "权益变化：（权益 − 净投入）的变化，包含浮动盈亏，已扣除追加 / 赎回。安装后才开始记录。",
+  carry: "扛单率：最终盈利的单子里，途中浮亏曾超过 -30% 的比例。越高说明领航员越爱扛单，设太紧的止损容易被误杀。",
+  giveback: "利润回吐率：浮盈曾经超过 20% 的单子，最后回吐了一半以上的比例。越高越适合自己分批止盈。",
   severity: "邮件级别：信息（开仓、启动汇总等）、提醒（第 1 档亏损、回撤等）、紧急（更高档亏损、凭证失效等）。凭证失效邮件无论如何都会发。",
 };
 const help = (k) => HELP[k] ? `<span class="help" data-help="${k}" tabindex="0" role="button" aria-label="说明">?</span>` : "";
@@ -29,9 +37,12 @@ const help = (k) => HELP[k] ? `<span class="help" data-help="${k}" tabindex="0" 
 /* ---------------- 工具 ---------------- */
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const num = (x, d = 2) => (x == null || isNaN(x) ? "-" : Number(x).toLocaleString("zh-CN", { minimumFractionDigits: d, maximumFractionDigits: d }));
-const signed = (x, d = 2) => (x == null || isNaN(x) ? "-" : (x > 0 ? "+" : "") + num(x, d));
-const U = (x, d = 2) => (x == null ? "-" : `<span class="num ${x > 0 ? "up" : x < 0 ? "down" : ""}">${signed(x, d)}U</span>`);
-const pct = (x, d = 1) => (x == null ? "-" : `<span class="num ${x > 0 ? "up" : x < 0 ? "down" : ""}">${signed(x * 100, d)}%</span>`);
+// 先按显示精度取整再判断正负，避免 -0.001 显示成红色的“-0.00”
+const rnd = (x, d) => Number(Number(x).toFixed(d)) || 0;
+const signed = (x, d = 2) => { if (x == null || isNaN(x)) return "-"; const v = rnd(x, d); return (v > 0 ? "+" : "") + num(v, d); };
+const tone = (v) => (v > 0 ? "up" : v < 0 ? "down" : "");
+const U = (x, d = 2) => (x == null ? "-" : `<span class="num ${tone(rnd(x, d))}">${signed(x, d)}U</span>`);
+const pct = (x, d = 1) => (x == null ? "-" : `<span class="num ${tone(rnd(x * 100, d))}">${signed(x * 100, d)}%</span>`);
 const side = (s) => ({ LONG: "多", SHORT: "空", HEDGE: "多空对冲" }[s] || s);
 function dt(ts) {
   if (!ts) return "-";
@@ -144,8 +155,9 @@ async function boot() {
   if (S.me.must_change) return renderChangePassword(true);
   S.settings = await api("GET", "/api/settings");
   if (!S.me.onboarding_done) return renderWizard(0);
+  // 只改 hash 时交给 hashchange 触发路由；hash 已存在才直接路由（避免同时跑两个 route）
   if (!location.hash) location.hash = "#/war";
-  route();
+  else route();
 }
 window.addEventListener("hashchange", () => S.me && S.me.onboarding_done !== false && route());
 
@@ -178,11 +190,11 @@ async function renderWizard(step) {
   bindEmailForm(() => setTimeout(() => renderWizard(2), 600));
   bindPresetCards(() => renderWizard(3));
   const done = document.getElementById("wDone");
-  if (done) done.onclick = async () => { await api("POST", "/api/onboarding/done", {}); S.me.onboarding_done = true; location.hash = "#/war"; route(); };
+  if (done) done.onclick = async () => { await api("POST", "/api/onboarding/done", {}); S.me.onboarding_done = true; if (location.hash === "#/war") route(); else location.hash = "#/war"; };
 }
 
 /* ---------------- 外壳 ---------------- */
-const NAV = [["war", "📊", "作战室"], ["positions", "📈", "持仓"], ["records", "🗂️", "记录"], ["settings", "⚙️", "设置"]];
+const NAV = [["war", "📊", "作战室"], ["positions", "📈", "持仓"], ["stats", "📅", "统计"], ["leaders", "🧭", "领航员"], ["records", "🗂️", "记录"], ["settings", "⚙️", "设置"]];
 function shell(active, title, chips, content) {
   return `<div class="app">
     <aside class="side">
@@ -202,25 +214,33 @@ function bindShell() {
 }
 
 async function route() {
+  const gen = ++S.gen;
   clearInterval(S.timer);
+  S.timer = null;
   document.querySelectorAll(".tip").forEach((t) => t.remove());
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   const page = parts[0] || "war";
   S.page = page;
   try {
     if (page === "positions") await pagePositions();
+    else if (page === "stats") await pageStats(parts[1]);
+    else if (page === "leaders") await (parts[1] ? pageLeader(parts[1]) : pageLeaders());
+    else if (page === "episode") await pageEpisode(parts[1]);
     else if (page === "records") await pageRecords(parts[1] || "alerts");
     else if (page === "settings") await pageSettings(parts[1] || "credentials");
     else await pageWar();
   } catch (e) {
-    if (S.me) root.innerHTML = shell(page, "出错了", "", `<div class="card msg err">${esc(e.message)}</div>`);
+    if (S.me && !stale(gen)) root.innerHTML = shell(page, "出错了", "", `<div class="card msg err">${esc(e.message)}</div>`);
   }
+  if (stale(gen)) return; // 期间已切到别的页面：不绑定、不创建定时器
   bindShell();
   if (page === "war" || page === "positions") {
-    S.timer = setInterval(() => {
+    const timer = setInterval(() => {
+      if (stale(gen)) { clearInterval(timer); return; }
       if (document.hidden || document.activeElement?.matches("input,textarea,select")) return;
-      (page === "war" ? pageWar : pagePositions)().then(bindShell).catch(() => {});
+      (page === "war" ? pageWar : pagePositions)().then(() => !stale(gen) && bindShell()).catch(() => {});
     }, 15000);
+    S.timer = timer;
   }
 }
 
@@ -235,6 +255,7 @@ function statusChips(ov) {
 
 /* ---------------- 作战室 ---------------- */
 async function pageWar() {
+  const gen = S.gen;
   const [ov, eq] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/equity?days=30").catch(() => ({ points: [] }))]);
   const t = ov.totals;
   let banner = "";
@@ -279,6 +300,7 @@ async function pageWar() {
   }).join("")}</div>`
     : `<div class="card empty">${ov.credentials.state === "valid" ? "暂时没有进行中的跟单" : "设置币安凭证后，这里会显示你的每个跟单"}</div>`;
 
+  if (stale(gen)) return;
   root.innerHTML = shell("war", "作战室", statusChips(ov), `
     ${banner}
     <div class="section card"><div class="card-h"><h2>今日待办</h2><span class="muted small">按紧急程度排序</span></div>${todos}</div>
@@ -313,6 +335,7 @@ function chart(points) {
 
 /* ---------------- 持仓 ---------------- */
 async function pagePositions() {
+  const gen = S.gen;
   const [ov, pv] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/positions")]);
   const sorted = pv.positions.slice().sort((a, b) => (b.tier || 0) - (a.tier || 0) || (a.unrealized_pnl - b.unrealized_pnl));
   const mineList = sorted.filter((p) => p.source === "copy"), publicList = sorted.filter((p) => p.source !== "copy");
@@ -331,7 +354,7 @@ async function pagePositions() {
       <td data-l="最深浮亏" class="r">${ep ? `${pct(ep.mae_roi)} <span class="muted small">${ep.mae_u != null ? signed(ep.mae_u) + "U" : ""}</span>` : pct(p.trough_roi)}</td>
       <td data-l="最高浮盈" class="r">${ep ? `${pct(ep.mfe_roi)} <span class="muted small">${ep.mfe_u != null ? signed(ep.mfe_u) + "U" : ""}</span>` : pct(p.peak_roi)}</td>
       <td data-l="持仓时长" class="r">${held}</td>
-      <td data-l=""><a class="btn sm" href="${esc(p.link)}" target="_blank" rel="noopener">币安 ↗</a></td></tr>`;
+      <td data-l="">${(p.episodes || []).length ? `<a class="btn sm" href="#/episode/${p.episodes[0].id}">时间线</a> ` : ""}<a class="btn sm ghost" href="${esc(p.link)}" target="_blank" rel="noopener">币安 ↗</a></td></tr>`;
     const legs = (p.legs || []).map((l) => `<tr class="sub"><td data-l="">└ ${side(l.side)}单</td><td data-l="开仓价">${num(l.entry_price, 4)}</td>
       <td data-l="保证金" class="r">${num(l.margin)}U</td><td data-l="浮动盈亏" class="r">${U(l.unrealized_pnl)}</td><td data-l="ROI" class="r">${pct(l.roi)}</td>
       <td colspan="5" class="hide-m"></td></tr>`).join("");
@@ -342,6 +365,7 @@ async function pagePositions() {
       <th>亏损档位${help("tier")}</th><th class="r">最深浮亏${help("mae")}</th><th class="r">最高浮盈${help("mfe")}</th><th class="r">持仓时长</th><th></th></tr></thead>
       <tbody>${rows(ps)}</tbody></table></div>`
     : `<div class="empty">${emptyText}</div>`;
+  if (stale(gen)) return;
   root.innerHTML = shell("positions", "持仓", statusChips(ov), `
     <div class="card"><div class="card-h"><h2>我的跟单仓位（${mineList.length}）</h2><span class="muted small">每 15 秒自动刷新 · 数据时间 ${dt(pv.updated)}</span></div>
     ${table(mineList, ov.credentials.state === "valid" ? "当前没有持仓" : "设置币安凭证后显示你的跟单仓位")}
@@ -355,8 +379,9 @@ const evLabel = (t) => EV_LABEL[String(t).split(".")[0]] || t;
 const EV_TYPES = [["", "全部类型"], ["position.", "仓位变化"], ["alert.", "提醒"], ["credential.", "凭证"], ["notify.", "邮件投递"],
   ["settings.", "设置修改"], ["data.", "数据中断/恢复"], ["leader.", "跟单增减"], ["service.", "服务"], ["auth.", "登录"]];
 async function pageRecords(tab) {
+  const gen = S.gen;
   const ov = await api("GET", "/api/overview");
-  const tabs = [["alerts", "提醒记录"], ["events", "事件日志"], ["episodes", "仓位回合"]]
+  const tabs = [["alerts", "提醒记录"], ["exits", "离场判定"], ["events", "事件日志"], ["episodes", "仓位回合"]]
     .map(([k, t]) => `<a href="#/records/${k}" class="${k === tab ? "on" : ""}">${t}</a>`).join("");
   let body = "";
   if (tab === "alerts") {
@@ -367,12 +392,16 @@ async function pageRecords(tab) {
           <div class="small ${a.delivered ? "muted" : "down"}">${a.delivered ? "✓ 已送达" : "✗ 未送达"}${a.error ? " · " + esc(a.error) : ""}</div>
           <details><summary class="small muted">查看完整内容</summary><pre>${esc(a.message)}</pre></details></div></div>`).join("")}</div>`
       : `<div class="empty">还没有提醒</div>`;
+  } else if (tab === "exits") {
+    const { exits } = await api("GET", "/api/exits?limit=300");
+    body = exitsTable(exits, true) + `<p class="hint">离场类型由系统对比你的成交记录和领航员的仓位自动判断${help("early")}。判断错了可以在“类型”里改；结论说明${help("verdict")}。</p>`;
   } else if (tab === "events") {
     body = `<div class="filters">
         <select id="evType">${EV_TYPES.map(([v, t]) => `<option value="${v}">${t}</option>`).join("")}</select>
         <select id="evLevel"><option value="">全部级别</option><option value="urgent">紧急</option><option value="warn">提醒</option><option value="info">信息</option></select>
         <input id="evQ" placeholder="搜索（币种、领航员…）" style="max-width:220px">
-        <button class="btn" id="evGo">筛选</button></div>
+        <button class="btn" id="evGo">筛选</button>
+        <a class="btn ghost" id="evCsv" download>导出 CSV</a><a class="btn ghost" id="evJson" download>导出 JSON</a></div>
       <div class="log" id="evList"></div><div class="actions"><button class="btn" id="evMore">加载更多</button></div>`;
   } else {
     const { episodes } = await api("GET", "/api/episodes?limit=200");
@@ -386,25 +415,33 @@ async function pageRecords(tab) {
         <td data-l="最高档">${e.max_tier ? `第 ${e.max_tier} 档` : "-"}</td>
         <td data-l="状态">${e.status === "open" ? '<span class="badge green">持仓中</span>' : `${esc(e.exit_type || "已平仓")} ${dt(e.closed_ts)}`}</td>
         <td data-l="标注">${(e.labels || []).map((l) => `<span class="badge ${/回吐|盈转亏|超过/.test(l) ? "yellow" : ""}">${esc(l)}</span>`).join(" ")}</td>
-        <td data-l=""><button class="btn sm" data-ep="${e.id}">时间线</button></td></tr>`).join("")}</tbody></table></div>
+        <td data-l=""><a class="btn sm" href="#/episode/${e.id}">时间线</a></td></tr>`).join("")}</tbody></table></div>
       <p class="hint">“利润回吐”：最高浮盈 ≥30% 但最后不到一半；“盈转亏”：最高浮盈 ≥30% 却亏损出场。这些数据会用于之后的分批止盈建议。</p>`
       : `<div class="empty">仓位回合从安装后开始记录，有持仓后这里会出现</div>`;
   }
+  if (stale(gen)) return;
   root.innerHTML = shell("records", "记录", statusChips(ov), `<div class="card"><div class="tabs">${tabs}</div>${body}</div>`);
   if (tab === "events") bindEvents();
-  root.querySelectorAll("[data-ep]").forEach((b) => (b.onclick = () => { location.hash = "#/records/events"; setTimeout(() => loadEvents(true, { episode: b.dataset.ep }), 50); }));
+  if (tab === "exits") bindExitsTable(() => pageRecords("exits").then(bindShell));
 }
 function bindEvents() {
   document.getElementById("evGo").onclick = () => loadEvents(true);
   document.getElementById("evQ").onkeydown = (e) => e.key === "Enter" && loadEvents(true);
   document.getElementById("evMore").onclick = () => loadEvents(false);
-  loadEvents(true);
+  const pending = S.evFilter; // 从“仓位回合 → 时间线”跳过来时带的筛选，只用一次
+  S.evFilter = null;
+  loadEvents(true, pending || undefined);
 }
 async function loadEvents(reset, extra) {
   const list = document.getElementById("evList");
   if (!list) return;
   if (reset) S.events = [];
-  const q = new URLSearchParams({ limit: 100, type: val("evType"), level: val("evLevel"), q: val("evQ"), ...(extra || {}) });
+  if (reset) S.evExtra = extra || null;
+  const q = new URLSearchParams({ limit: 100, type: val("evType"), level: val("evLevel"), q: val("evQ"), ...(S.evExtra || {}) });
+  const ex = new URLSearchParams({ type: val("evType"), level: val("evLevel"), q: val("evQ"), ...(S.evExtra || {}) });
+  const csv = document.getElementById("evCsv"), js = document.getElementById("evJson");
+  if (csv) csv.href = "/api/events/export?format=csv&" + ex;
+  if (js) js.href = "/api/events/export?format=json&" + ex;
   if (!reset && S.events.length) q.set("before", S.events[S.events.length - 1].id);
   const { events } = await api("GET", "/api/events?" + q);
   S.events = S.events.concat(events);
@@ -417,6 +454,7 @@ const val = (id) => (document.getElementById(id) || {}).value || "";
 
 /* ---------------- 设置 ---------------- */
 async function pageSettings(tab) {
+  const gen = S.gen;
   const [ov, st] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/settings")]);
   S.settings = st;
   const tabs = [["credentials", "币安凭证"], ["email", "邮件提醒"], ["rules", "风控参数"], ["account", "账号与系统"]]
@@ -425,14 +463,15 @@ async function pageSettings(tab) {
   if (tab === "credentials") body = credStatus(st) + credForm();
   if (tab === "email") body = emailForm();
   if (tab === "rules") body = rulesForm(st);
-  if (tab === "account") body = renderChangePassword(false) + `<div class="card"><h3>系统</h3>
+  if (tab === "account") body = renderChangePassword(false) + maintForm(st) + `<div class="card"><h3>系统</h3>
       <p class="muted small">版本 v${esc(S.me.version)}。更新：在服务器执行 <code>cd /opt/bian && ./start.sh update</code>（几秒钟，数据和设置都会保留）。</p>
       <p class="muted small">查看运行日志：<code>./start.sh logs</code>；自检：<code>./start.sh doctor</code>。</p></div>`;
+  if (stale(gen)) return;
   root.innerHTML = shell("settings", "设置", statusChips(ov), `<div class="card"><div class="tabs">${tabs}</div>${body}</div>`);
   if (tab === "credentials") bindCredForm(() => pageSettings("credentials").then(bindShell));
   if (tab === "email") bindEmailForm();
   if (tab === "rules") bindRulesForm();
-  if (tab === "account") bindPassword(false);
+  if (tab === "account") { bindPassword(false); bindMaintForm(); }
 }
 
 function credStatus(st) {
@@ -679,4 +718,284 @@ function bindRulesForm() {
 }
 
 /* ---------------- 入口 ---------------- */
+
+/* ================= 第二期：统计 / 领航员 / 时间线 / 离场判定 ================= */
+const VERDICT_CLS = { "止损挽回": "green", "避免回吐": "green", "比领航员多赚": "green", "白止损": "red", "少赚": "yellow", "比领航员多亏": "red", "未知": "", "跟随": "" };
+const EXIT_TYPES = ["跟随平仓", "提前离场", "提前部分离场", "滞后平仓", "跟单结束"];
+const day = (ms) => (ms ? dt(ms / 1000) : "-");
+
+function exitsTable(list, withLeader) {
+  if (!list.length) return `<div class="empty">还没有离场记录（你的跟单仓位减仓或平仓后会出现）</div>`;
+  return `<div class="tbl-wrap"><table class="cards"><thead><tr><th>时间</th>${withLeader ? "<th>领航员</th>" : ""}<th>币种</th>
+    <th>类型${help("early")}</th><th class="r">数量</th><th class="r">实际</th><th class="r">跟到底</th><th>结论${help("verdict")}</th><th>备注</th><th></th></tr></thead><tbody>
+    ${list.map((x) => `<tr>
+      <td data-l="时间">${dt(x.ts)}</td>${withLeader ? `<td data-l="领航员">${esc(x.leader_name)}</td>` : ""}
+      <td data-l="币种"><b>${esc(x.symbol)}</b> ${side(x.side)}${x.partial ? ' <span class="badge">部分</span>' : ""}</td>
+      <td data-l="类型"><select class="sm-sel" data-exit="${x.id}">${(EXIT_TYPES.includes(x.exit_type) ? [] : [x.exit_type]).concat(EXIT_TYPES)
+        .map((t) => `<option ${t === x.exit_type ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>${x.manual ? ' <span class="badge">手动</span>' : ""}</td>
+      <td data-l="数量" class="r num">${num(x.qty, 4)}</td>
+      <td data-l="实际" class="r">${x.actual_u == null ? '<span class="muted">待同步</span>' : U(x.actual_u)}</td>
+      <td data-l="跟到底" class="r">${x.hypo_u == null ? '<span class="muted">-</span>' : U(x.hypo_u)}</td>
+      <td data-l="结论">${x.verdict ? `<span class="badge ${VERDICT_CLS[x.verdict] || ""}">${esc(x.verdict)}${x.delta_u != null && x.verdict !== "跟随" ? " " + num(Math.abs(x.delta_u)) + "U" : ""}</span>`
+        : x.status === "waiting" ? '<span class="badge yellow">等领航员平仓</span>' : '<span class="muted">判定中</span>'}</td>
+      <td data-l="备注" class="small">${esc(x.remarks || "")}</td>
+      <td data-l="">${x.episode_id ? `<a class="btn sm" href="#/episode/${x.episode_id}">时间线</a>` : ""}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+function bindExitsTable(after) {
+  root.querySelectorAll("[data-exit]").forEach((sel) => (sel.onchange = async () => {
+    try {
+      await api("POST", "/api/exits/manual", { id: Number(sel.dataset.exit), exit_type: sel.value });
+      toast("已修改离场类型；提前类型会在领航员平仓后重新结算");
+      after && after();
+    } catch (e) { toast(e.message); }
+  }));
+}
+
+/* ---------- 小图表（内联 SVG，不依赖外部库） ---------- */
+function bars(items, valueKey, labelKey, h = 140) {
+  if (!items.length) return `<div class="empty">暂无数据</div>`;
+  const W = 800, P = 24, max = Math.max(...items.map((i) => Math.abs(i[valueKey] || 0)), 1e-9);
+  const bw = (W - P * 2) / items.length, mid = h / 2;
+  return `<svg class="chart" viewBox="0 0 ${W} ${h}" preserveAspectRatio="none">
+    <line class="zero" x1="${P}" x2="${W - P}" y1="${mid}" y2="${mid}"/>
+    ${items.map((it, i) => { const v = it[valueKey] || 0, bh = (Math.abs(v) / max) * (mid - 14);
+      return `<rect class="${v >= 0 ? "bar-up" : "bar-dn"}" x="${P + i * bw + bw * 0.15}" y="${v >= 0 ? mid - bh : mid}" width="${bw * 0.7}" height="${Math.max(bh, 0.5)}"><title>${esc(it[labelKey])}：${signed(v)}</title></rect>`; }).join("")}
+    <text x="${P}" y="12">${esc(items[0][labelKey])}</text><text x="${W - P}" y="12" text-anchor="end">${esc(items[items.length - 1][labelKey])}</text></svg>`;
+}
+
+/* ---------- 统计页 ---------- */
+async function pageStats(monthArg) {
+  const gen = S.gen;
+  const now = new Date();
+  const month = /^\d{4}-\d{1,2}$/.test(monthArg || "") ? monthArg : `${now.getFullYear()}-${now.getMonth() + 1}`;
+  const [ov, st] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/stats?month=" + month)]);
+  if (stale(gen)) return;
+  const mode = S.calMode || "net";
+  const c = st.calendar;
+  const [y, m] = [c.year, c.month];
+  const prev = m === 1 ? `${y - 1}-12` : `${y}-${m - 1}`, next = m === 12 ? `${y + 1}-1` : `${y}-${m + 1}`;
+  const vals = c.days.map((d) => (mode === "net" ? d.net : d.equity_change)).filter((v) => v != null);
+  const maxAbs = Math.max(...vals.map(Math.abs), 1e-9);
+  const lead = (c.first_weekday + 7) % 7; // Python: 周一=0
+  const cells = Array(lead).fill('<div class="cal-cell empty"></div>').concat(c.days.map((d) => {
+    const v = mode === "net" ? d.net : d.equity_change;
+    const a = v == null ? 0 : Math.min(1, Math.abs(v) / maxAbs);
+    const cls = v == null ? "" : v > 0 ? "pos" : v < 0 ? "neg" : "";
+    return `<div class="cal-cell ${cls}" style="--a:${(0.12 + a * 0.6).toFixed(2)}" title="${d.date}${d.trades ? ` · 平仓 ${d.trades} 笔 · 手续费 ${signed(d.fee)}U` : ""}${d.equity_change != null ? ` · 权益变化 ${signed(d.equity_change)}U` : ""}">
+      <span class="d">${Number(d.date.slice(8))}</span><span class="v num">${v == null ? "" : signed(v, Math.abs(v) >= 100 ? 0 : 1)}</span></div>`;
+  })).join("");
+  const P = st.periods;
+  const pc = (k, t) => `<div class="card kpi"><div class="label">${t}</div><div class="value num">${U(P[k].net)}</div><div class="sub">平仓 ${P[k].trades} 笔 · 手续费 ${signed(P[k].fee)}U</div></div>`;
+  const co = st.composition, ex = st.exits, exm = st.exits_month, lo = st.losses;
+  const comp = (o, t) => `<dl class="kv"><dt>${t} 已实现盈亏</dt><dd>${U(o.realized)}</dd><dt>手续费</dt><dd>${U(o.fee)}</dd><dt>分润</dt><dd>${U(o.profit_shared)}</dd>
+      <dt><b>净额</b></dt><dd><b>${U(o.realized + o.fee + o.profit_shared)}</b></dd></dl>`;
+  const exCard = (e, t) => `<dl class="kv"><dt>${t}跟随平仓</dt><dd>${e.follow} 次</dd><dt>提前离场${help("early")}</dt><dd>${e.early} 次${e.waiting ? `（另有 ${e.waiting} 笔等领航员平仓）` : ""}</dd>
+      <dt>止损挽回</dt><dd>${e.saved_n} 次 ${U(e.saved_u)}</dd><dt>白止损</dt><dd>${e.wasted_n} 次 ${U(-e.wasted_u)}</dd>
+      <dt>避免回吐</dt><dd>${e.avoid_giveback_n} 次 ${U(e.avoid_giveback_u)}</dd><dt>少赚</dt><dd>${e.missed_n} 次 ${U(-e.missed_u)}</dd>
+      <dt><b>提前离场净效果</b>${help("verdict")}</dt><dd><b>${U(e.net_u)}</b></dd></dl>`;
+  root.innerHTML = shell("stats", "统计", statusChips(ov), `
+    <div class="grid kpis">${pc("today", "今日")}${pc("yesterday", "昨日")}${pc("week", "本周")}${pc("month", "本月")}${pc("d30", "近 30 天")}${pc("all", "全部")}</div>
+    <p class="hint">以上为已实现净盈亏${help("realized")}。已同步 ${st.sync.fills} 笔成交${st.sync.since_ms ? `，最早 ${day(st.sync.since_ms)}` : "（首次同步需要几分钟，凭证有效时自动进行）"}。</p>
+    <div class="section card"><div class="card-h"><h2>盈亏日历 · ${y} 年 ${m} 月</h2>
+      <div class="actions"><a class="btn sm" href="#/stats/${prev}">‹ 上月</a><a class="btn sm" href="#/stats/${next}">下月 ›</a>
+      <button class="btn sm ${mode === "net" ? "primary" : ""}" data-cal="net">已实现${help("realized")}</button><button class="btn sm ${mode === "eq" ? "primary" : ""}" data-cal="eq">权益变化${help("equity_change")}</button></div></div>
+      <div class="cal-head">${["一", "二", "三", "四", "五", "六", "日"].map((w) => `<div>${w}</div>`).join("")}</div>
+      <div class="cal">${cells}</div>
+      <p class="hint">本月已实现 ${U(c.total_net)}，盈利 ${c.win_days} 天、亏损 ${c.loss_days} 天。颜色越深金额越大。</p></div>
+    <div class="section grid two">
+      <div class="card"><h3>盈亏构成</h3>${comp(co.month, "本月")}<hr class="sep">${comp(co.all, "全部")}
+        <p class="hint">当前浮动盈亏 ${U(co.unrealized)}（未计入上面）。资金费币安接口没有数据，不含。</p></div>
+      <div class="card"><h3>止损 / 提前离场效果</h3>${exCard(exm, "本月 ")}<hr class="sep">${exCard(ex, "全部 ")}
+        <p class="hint">每次离场的明细在“记录 → 离场判定”。</p></div>
+    </div>
+    <div class="section grid two">
+      <div class="card"><h3>最大的 10 笔亏损</h3>${lo.worst.length ? `<table><tbody>${lo.worst.map((w) => `<tr><td>${esc(w.leader_name)}</td><td><b>${esc(w.symbol)}</b> ${side(w.side)} ${num(w.leverage, 0)}x</td><td class="small muted">${day(w.closed_ms)}</td><td class="r">${U(w.pnl)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">没有亏损单</div>`}
+        <p class="hint">共 ${lo.closed_n} 笔已平仓；最长连续亏损 ${lo.max_loss_streak_days} 天。</p></div>
+      <div class="card"><h3>单笔盈亏分布（U）</h3>${bars(lo.distribution, "count", "range")}
+        <div class="small muted dist">${lo.distribution.map((d) => `<span>${esc(d.range)}: ${d.count}</span>`).join("")}</div></div>
+    </div>
+    <div class="section card"><h3>利润回吐（我的仓位）${help("giveback")}</h3>
+      ${st.giveback.length ? `<div class="tbl-wrap"><table class="cards"><thead><tr><th>领航员</th><th class="r">已平仓回合</th><th class="r">利润回吐</th><th class="r">盈转亏</th><th class="r">未分批止盈</th><th class="r">少拿的利润</th></tr></thead><tbody>
+        ${st.giveback.map((g) => `<tr><td data-l="领航员"><a href="#/leaders/${esc(g.lead_id)}">${esc(g.name)}</a></td><td data-l="已平仓回合" class="r">${g.closed}</td><td data-l="利润回吐" class="r">${g.giveback}</td><td data-l="盈转亏" class="r">${g.profit_to_loss}</td><td data-l="未分批止盈" class="r">${g.no_partial_tp}</td><td data-l="少拿的利润" class="r">${U(-g.lost_u)}</td></tr>`).join("")}</tbody></table></div>`
+        : `<div class="empty">仓位回合从安装后开始记录，平仓后这里会出现</div>`}
+      <p class="hint">“少拿的利润” = 持仓过程最高浮盈 − 最后结果。经常回吐的领航员，适合你自己分批止盈。</p></div>`);
+  root.querySelectorAll("[data-cal]").forEach((b) => (b.onclick = (e) => { if (e.target.closest("[data-help]")) return; S.calMode = b.dataset.cal; pageStats(month).then(bindShell); }));
+}
+
+/* ---------- 领航员 ---------- */
+const RANK_COLS = [
+  ["name", "领航员"], ["equity", "权益"], ["pnl", "累计盈亏"], ["month_net", "本月已实现"], ["drawdown", "回撤"],
+  ["win_rate", "我的胜率"], ["payoff", "盈亏比"], ["exits_net_u", "提前离场净效果"], ["carry_rate", "扛单率"], ["giveback_rate", "回吐率"], ["alerts", "提醒数"],
+];
+async function pageLeaders() {
+  const gen = S.gen;
+  const [ov, { leaders }] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/leaders")]);
+  if (stale(gen)) return;
+  const key = S.rankKey || "pnl", dir = S.rankDir || -1;
+  const sorted = leaders.slice().sort((a, b) => {
+    const x = a[key], y = b[key];
+    if (x == null) return 1; if (y == null) return -1;
+    return (typeof x === "string" ? x.localeCompare(y) : x - y) * dir;
+  });
+  const job = (j) => !j ? "" : j.state === "done" ? "" : j.state === "error" ? '<span class="badge red">分析出错</span>'
+    : `<span class="badge yellow">分析中 ${j.total ? `${j.progress}/${j.total}` : ""}</span>`;
+  const dev = (d) => !d ? "" : (d.missing || d.over || d.under) ? `<span class="badge yellow" title="超配 ${d.over} · 低配 ${d.under} · 漏单 ${d.missing}">偏差 ${d.over + d.under + d.missing}</span>` : "";
+  root.innerHTML = shell("leaders", "领航员", statusChips(ov), `
+    <div class="card"><div class="card-h"><h2>领航员排行</h2><span class="muted small">点列头排序</span></div>
+    ${sorted.length ? `<div class="tbl-wrap"><table class="cards rank"><thead><tr>${RANK_COLS.map(([k, t]) => `<th class="${k === "name" ? "" : "r"} sort" data-k="${k}">${t}${k === "carry_rate" ? help("carry") : k === "giveback_rate" ? help("giveback") : k === "exits_net_u" ? help("verdict") : ""}${key === k ? (dir > 0 ? " ▲" : " ▼") : ""}</th>`).join("")}</tr></thead><tbody>
+      ${sorted.map((r) => `<tr class="click" data-go="${esc(r.lead_id)}">
+        <td data-l="领航员"><b>${esc(r.name)}</b> ${r.kind === "watch" ? '<span class="badge">观察</span>' : ""} ${job(r.job)} ${dev(r.deviation)}<div class="tags">${(r.tags || []).slice(0, 4).map((t) => `<span class="badge">${esc(t)}</span>`).join("")}</div></td>
+        <td data-l="权益" class="r num">${r.equity == null ? "-" : num(r.equity) + "U"}</td>
+        <td data-l="累计盈亏" class="r">${r.pnl == null ? "-" : U(r.pnl)}</td>
+        <td data-l="本月已实现" class="r">${U(r.month_net)}</td>
+        <td data-l="回撤" class="r">${r.drawdown == null ? "-" : num(r.drawdown * 100, 1) + "%"}</td>
+        <td data-l="我的胜率" class="r">${r.win_rate == null ? "-" : num(r.win_rate * 100, 0) + "%"} <span class="small muted">${r.closed || 0} 笔</span></td>
+        <td data-l="盈亏比" class="r">${r.payoff == null ? "-" : num(r.payoff)}</td>
+        <td data-l="提前离场净效果" class="r">${r.early_n ? U(r.exits_net_u) + ` <span class="small muted">${r.early_n} 次</span>` : "-"}</td>
+        <td data-l="扛单率" class="r">${r.carry_rate == null ? "-" : num(r.carry_rate * 100, 0) + "%"}</td>
+        <td data-l="回吐率" class="r">${r.giveback_rate == null ? "-" : num(r.giveback_rate * 100, 0) + "%"}</td>
+        <td data-l="提醒数" class="r">${r.alerts}</td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="empty">设置币安凭证后，你跟单的领航员会自动出现在这里，并在后台分析历史</div>`}</div>
+    <form class="card" id="watchForm"><h3>分析其他领航员</h3>
+      <p class="muted small">想跟一个新领航员？输入他主页网址里 lead-details/ 后面那串数字，系统会抓取他的历史并做风格画像和回测（只读，不影响你的账户）。</p>
+      <div class="row"><label class="f"><span>领航员 ID</span><input name="id" inputmode="numeric" placeholder="例如 4708220152086930177"></label>
+      <label class="f"><span>备注名（可选）</span><input name="name"></label></div>
+      <button class="btn">开始分析</button><div id="watchMsg"></div></form>`);
+  root.querySelectorAll("th.sort").forEach((th) => (th.onclick = (e) => {
+    if (e.target.closest("[data-help]")) return;
+    S.rankDir = S.rankKey === th.dataset.k ? -(S.rankDir || -1) : -1; S.rankKey = th.dataset.k; pageLeaders().then(bindShell);
+  }));
+  root.querySelectorAll("tr[data-go]").forEach((tr) => (tr.onclick = (e) => { if (!e.target.closest("[data-help]")) location.hash = "#/leaders/" + tr.dataset.go; }));
+  document.getElementById("watchForm").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target), box = document.getElementById("watchMsg");
+    try { const r = await api("POST", "/api/leaders/analyze", { id: f.get("id").trim(), name: f.get("name").trim() }); box.innerHTML = `<div class="msg ok">${esc(r.message)}</div>`; setTimeout(() => pageLeaders().then(bindShell), 1200); }
+    catch (err) { box.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+  };
+}
+
+function scatter(points) {
+  if (!points.length) return `<div class="empty">历史分析完成后显示</div>`;
+  const W = 800, H = 260, P = 32;
+  const xs = points.map((p) => p.mae), ys = points.map((p) => p.mfe);
+  const x0 = Math.min(...xs, -0.1), y1 = Math.max(...ys, 0.1);
+  const X = (v) => P + ((v - x0) / (0 - x0)) * (W - P * 2), Y = (v) => H - P - (v / y1) * (H - P * 2);
+  return `<svg class="chart tall" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line class="zero" x1="${X(0)}" x2="${X(0)}" y1="${P}" y2="${H - P}"/><line class="zero" x1="${P}" x2="${W - P}" y1="${Y(0)}" y2="${Y(0)}"/>
+    ${points.map((p) => `<circle class="${p.win ? "pt-win" : "pt-loss"}" cx="${X(p.mae).toFixed(1)}" cy="${Y(p.mfe).toFixed(1)}" r="3.5"><title>最深浮亏 ${signed(p.mae * 100, 0)}% · 最高浮盈 ${signed(p.mfe * 100, 0)}% · ${p.win ? "盈利" : "亏损"}</title></circle>`).join("")}
+    <text x="${P}" y="${H - 8}">← 最深浮亏 ${signed(x0 * 100, 0)}%</text><text x="${X(0)}" y="14" text-anchor="end">最高浮盈 ${signed(y1 * 100, 0)}% ↑</text></svg>
+    <p class="hint">每个点是一笔历史仓位：越靠左过程中亏得越深，越靠上过程中赚得越多；<span class="up">绿点</span>最终盈利、<span class="down">红点</span>最终亏损。很多绿点在很左边 = 爱扛单，止损太紧会误杀。</p>`;
+}
+function btRows(list) {
+  return `<table><thead><tr><th>方案</th><th class="r">累计收益</th><th class="r">最大回撤</th><th class="r">最差单笔</th><th class="r">误杀盈利单</th></tr></thead><tbody>
+    ${list.filter(Boolean).map((b) => `<tr><td>${esc(b.label)}</td><td class="r">${signed(b.total)}</td><td class="r">${num(b.max_dd)}</td><td class="r">${pct(b.worst, 0)}</td><td class="r">${b.winners_cut}</td></tr>`).join("")}</tbody></table>`;
+}
+async function pageLeader(id) {
+  const gen = S.gen;
+  const [ov, d] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/leaders/detail?id=" + encodeURIComponent(id))]);
+  if (stale(gen)) return;
+  const pr = d.profile, p = pr ? pr.profile : null, r = d.ranking || {}, j = d.job;
+  const jobLine = !j ? "还没有分析" : j.state === "done" ? `已分析 ${pr ? pr.n : 0} 笔历史仓位（${dt(pr && pr.computed_at)}）`
+    : j.state === "error" ? `分析出错：${esc(j.message)}` : `分析中：${esc(j.message || "")} ${j.total ? `${j.progress}/${j.total}` : ""}`;
+  const metric = (t, v, h) => `<div class="card kpi"><div class="label">${t}${h ? help(h) : ""}</div><div class="value num">${v}</div></div>`;
+  const bt = pr && pr.backtest;
+  // 只观察、从没跟单过的领航员，不显示“我的”结果
+  const mine = d.kind === "copy" || d.my_positions.length > 0 || d.exits.length > 0;
+  root.innerHTML = shell("leaders", esc(d.name), statusChips(ov), `
+    <div class="card"><div class="card-h"><div><a href="#/leaders" class="small">‹ 领航员排行</a> ${d.kind === "watch" ? '<span class="badge">观察</span>' : '<span class="badge green">跟单中</span>'}</div>
+      <div class="actions"><button class="btn sm" id="reAnalyze">重新分析</button><a class="btn sm ghost" href="${esc(d.link)}" target="_blank" rel="noopener">币安主页 ↗</a></div></div>
+      <p class="muted small">${jobLine}</p>
+      ${p && p.tags && p.tags.length ? `<div class="tags">${p.tags.map((t) => `<span class="badge yellow">${esc(t)}</span>`).join(" ")}</div>` : ""}</div>
+    ${mine && r.lead_id ? `<h3 class="section">我在他身上的结果</h3><div class="grid kpis">
+      ${metric("累计盈亏", r.pnl == null ? "-" : U(r.pnl))}${metric("本月已实现", U(r.month_net))}${metric("回撤", r.drawdown == null ? "-" : num(r.drawdown * 100, 1) + "%", "drawdown")}
+      ${metric("我的胜率", r.win_rate == null ? "-" : num(r.win_rate * 100, 0) + "%")}${metric("盈亏比", r.payoff == null ? "-" : num(r.payoff))}${metric("提前离场净效果", d.exits_summary.early ? U(d.exits_summary.net_u) : "-", "verdict")}</div>` : ""}
+    ${p ? `<h3 class="section">领航员风格画像（他自己的历史）</h3><div class="grid kpis">
+      ${metric("胜率", num(p.win_rate * 100, 0) + "%")}${metric("盈亏比", num(p.payoff))}${metric("扛单率", p.carry_rate == null ? "-" : num(p.carry_rate * 100, 0) + "%", "carry")}
+      ${metric("利润回吐率", p.giveback_rate == null ? "-" : num(p.giveback_rate * 100, 0) + "%", "giveback")}${metric("杠杆中位", num(p.leverage_median, 0) + "x")}${metric("持仓时长中位", num(p.duration_median_h, 1) + "h")}
+      ${metric("最深浮亏中位", p.mae_median == null ? "-" : pct(p.mae_median), "mae")}${metric("最差 10% 浮亏", p.mae_p10 == null ? "-" : pct(p.mae_p10))}
+      ${metric("盈利单浮盈中位", p.winner_mfe_p50 == null ? "-" : pct(p.winner_mfe_p50), "mfe")}${metric("盈利单浮盈 P75", p.winner_mfe_p75 == null ? "-" : pct(p.winner_mfe_p75))}
+      ${metric("最大连亏", p.max_loss_streak + " 笔")}${metric("前 5 大亏损占比", num(p.top5_loss_share * 100, 0) + "%")}</div>
+      ${!p.sample_ok ? '<p class="hint">⚠️ 样本少于 30 笔，以上结论仅供参考。</p>' : ""}
+      <div class="section card"><h3>每笔仓位：过程最深浮亏 vs 最高浮盈</h3>${scatter(d.mae_mfe)}</div>` : ""}
+    ${bt ? `<div class="section grid two"><div class="card"><h3>只设硬止损（币安里能直接设置）</h3>${btRows([bt.baseline, ...bt.stop_only])}</div>
+      <div class="card"><h3>全部组合前 10</h3>${btRows([bt.baseline, ...bt.ranked])}
+      <p class="hint">${bt.oos.train_best ? `样本外检验：前 ${bt.oos.n_train} 笔选出“${esc(bt.oos.train_best.label)}”，在后 ${bt.oos.n_test} 笔上 ${signed(bt.oos.test_best.total)}（原始跟单 ${signed(bt.oos.test_baseline.total)}）。` : "样本不足，未做样本外检验。"}
+      收益单位 = 每笔投入 1 份保证金的倍数。历史表现不代表未来。</p></div></div>` : ""}
+    ${!mine ? `<div class="section card"><div class="empty">你没有跟单这个领航员，这里只显示他自己的历史风格。跟单后会出现你在他身上的盈亏、离场记录和历史仓位。</div></div>` : `<div class="section card"><h3>我的离场记录</h3>${exitsTable(d.exits, false)}</div>
+    <div class="section card"><h3>我的历史仓位（最近 50 笔）</h3>${d.my_positions.length ? `<div class="tbl-wrap"><table class="cards"><thead><tr><th>开仓</th><th>平仓</th><th>币种</th><th class="r">开仓价</th><th class="r">平仓价</th><th class="r">盈亏</th><th>状态</th></tr></thead><tbody>
+      ${d.my_positions.map((m) => `<tr><td data-l="开仓">${day(m.opened_ms)}</td><td data-l="平仓">${day(m.closed_ms)}</td><td data-l="币种"><b>${esc(m.symbol)}</b> ${side(m.side)} ${num(m.leverage, 0)}x</td>
+        <td data-l="开仓价" class="r num">${num(m.avg_cost, 4)}</td><td data-l="平仓价" class="r num">${num(m.avg_close, 4)}</td><td data-l="盈亏" class="r">${U(m.pnl)}</td><td data-l="状态" class="small">${esc(m.status)}</td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="empty">还没有同步到你的历史仓位</div>`}</div>`}`);
+  document.getElementById("reAnalyze").onclick = async () => { const r2 = await api("POST", "/api/leaders/analyze", { id: d.lead_id, name: d.name }); toast(r2.message); pageLeader(id).then(bindShell); };
+  bindExitsTable(() => pageLeader(id).then(bindShell));
+}
+
+/* ---------- 仓位时间线 ---------- */
+function timeline(points, events) {
+  if (points.length < 2) return `<div class="empty">持仓时间太短，还没有足够的采样点（每 5 分钟一个）</div>`;
+  const W = 800, H = 220, P = 30;
+  const xs = points.map((p) => p.ts), ys = points.map((p) => p.roi);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs, ...events.map((e) => e.ts).filter((t) => t <= Math.max(...xs) + 3600));
+  let y0 = Math.min(...ys, 0), y1 = Math.max(...ys, 0); if (y1 - y0 < 1e-9) { y0 -= 0.1; y1 += 0.1; }
+  const X = (t) => P + ((t - x0) / (x1 - x0 || 1)) * (W - P * 2), Y = (v) => H - P - ((v - y0) / (y1 - y0)) * (H - P * 2);
+  const d = points.map((p, i) => `${i ? "L" : "M"}${X(p.ts).toFixed(1)},${Y(p.roi).toFixed(1)}`).join("");
+  const marks = events.filter((e) => e.ts >= x0 && e.ts <= x1).map((e) => {
+    const cls = e.type.startsWith("alert") ? "mk-alert" : e.type.startsWith("exit") || e.type === "position.close" ? "mk-exit" : "mk-pos";
+    return `<line class="${cls}" x1="${X(e.ts)}" x2="${X(e.ts)}" y1="${P}" y2="${H - P}"><title>${dt(e.ts)} ${esc(e.title)}</title></line>`;
+  }).join("");
+  return `<svg class="chart tall" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line class="zero" x1="${P}" x2="${W - P}" y1="${Y(0)}" y2="${Y(0)}"/>${marks}<path class="ln" d="${d}"/>
+    <text x="${P}" y="14">${dt(x0)}</text><text x="${W - P}" y="14" text-anchor="end">${dt(x1)}</text>
+    <text x="${P}" y="${H - 8}">ROI 最低 ${signed(Math.min(...ys) * 100, 1)}%</text><text x="${W - P}" y="${H - 8}" text-anchor="end">最高 ${signed(Math.max(...ys) * 100, 1)}%</text></svg>
+    <p class="hint">折线是这个仓位的 ROI；竖线是事件：<span class="mk-pos-t">蓝 = 开仓 / 加减仓</span>、<span class="mk-alert-t">黄 = 提醒</span>、<span class="mk-exit-t">红 = 离场</span>。鼠标移上去看详情。</p>`;
+}
+async function pageEpisode(id) {
+  const gen = S.gen;
+  const [ov, d] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/episode?id=" + encodeURIComponent(id))]);
+  if (stale(gen)) return;
+  const e = d.episode, lp = d.leader_position;
+  root.innerHTML = shell("records", `${esc(e.leader_name)} · ${esc(e.symbol)} ${side(e.side)}`, statusChips(ov), `
+    <div class="card"><div class="card-h"><a href="#/records/episodes" class="small">‹ 仓位回合</a>
+      <div class="actions"><a class="btn sm ghost" href="${esc(d.link)}" target="_blank" rel="noopener">币安 ↗</a></div></div>
+      <div class="tags">${e.status === "open" ? '<span class="badge green">持仓中</span>' : `<span class="badge">${esc(e.exit_type || "已平仓")}</span>`}
+        ${(e.labels || []).map((l) => `<span class="badge yellow">${esc(l)}</span>`).join(" ")}</div>
+      <dl class="kv kv-wide"><dt>开仓</dt><dd>${dt(e.opened_ts)} @ ${num(e.first_entry, 4)}</dd><dt>${e.status === "open" ? "现在" : "平仓"}</dt><dd>${e.status === "open" ? dt(e.last_seen) : dt(e.closed_ts)} · ROI ${pct(e.last_roi)}${e.last_u != null ? " · " + U(e.last_u) : ""}</dd>
+        <dt>最深浮亏${help("mae")}</dt><dd>${pct(e.mae_roi)}${e.mae_u != null ? " · " + U(e.mae_u) : ""}（${dt(e.mae_ts)}）</dd><dt>最高浮盈${help("mfe")}</dt><dd>${pct(e.mfe_roi)}${e.mfe_u != null ? " · " + U(e.mfe_u) : ""}（${dt(e.mfe_ts)}）</dd>
+        <dt>杠杆 / 最大数量</dt><dd>${num(e.leverage, 0)}x / ${num(e.max_qty, 4)}</dd><dt>加仓 / 减仓</dt><dd>${e.adds} / ${e.reduces}（盈利中减仓 ${e.reduces_in_profit}）</dd>
+        <dt>最高亏损档位</dt><dd>${e.max_tier ? "第 " + e.max_tier + " 档" : "-"} · 提醒 ${e.alerts} 次</dd>
+        <dt>领航员对应仓位</dt><dd>${lp ? `${day(lp.opened)} 开 · ${lp.closed_ms ? `${day(lp.closed_ms)} 平 @ ${num(lp.avg_close, 4)}` : "还没平"}` : "还没找到（领航员平仓后会出现）"}</dd></dl></div>
+    <div class="section card"><h3>ROI 走势</h3>${timeline(d.points, d.events)}</div>
+    <div class="section card"><h3>离场判定</h3>${exitsTable(d.exits, false)}</div>
+    <div class="section card"><div class="card-h"><h3>事件</h3><a class="btn sm" id="allEv">在事件日志里查看</a></div>
+      ${d.events.length ? `<div class="log">${d.events.map((x) => `<div class="ev"><div class="tm">${dt(x.ts)}<br><span class="badge ${x.level === "urgent" ? "red" : x.level === "warn" ? "yellow" : ""}">${esc(evLabel(x.type))}</span></div><div>${esc(x.title)}</div></div>`).join("")}</div>` : `<div class="empty">没有事件</div>`}</div>`);
+  document.getElementById("allEv").onclick = () => { S.evFilter = { episode: String(e.id) }; location.hash = "#/records/events"; };
+  bindExitsTable(() => pageEpisode(id).then(bindShell));
+}
+
+/* ---------- 设置：每日摘要 / 自动备份 ---------- */
+function maintForm(st) {
+  const m = st.maintenance;
+  return `<form class="card" id="maintForm"><h3>每日摘要与自动备份</h3>
+    <div class="row">
+      <label class="f"><span><label class="switch"><input type="checkbox" name="digest_enabled" ${m.digest_enabled ? "checked" : ""}> 每日摘要邮件</label></span>
+        <input name="digest_time" type="time" value="${esc(m.digest_time)}"><div class="hint">昨天的盈亏、各领航员表现、风险仓位、待办，每天一封</div></label>
+      <label class="f"><span><label class="switch"><input type="checkbox" name="backup_enabled" ${m.backup_enabled ? "checked" : ""}> 每天自动备份</label></span>
+        <input name="backup_time" type="time" value="${esc(m.backup_time)}"><div class="hint">数据库和设置，保留最近 7 份（/opt/bian/data/backups）</div></label>
+    </div><button class="btn primary">保存</button><div id="maintMsg"></div></form>`;
+}
+function bindMaintForm() {
+  const f = document.getElementById("maintForm");
+  if (!f) return;
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    const d = new FormData(f), box = document.getElementById("maintMsg");
+    try {
+      await api("PUT", "/api/settings", { maintenance: { digest_enabled: d.get("digest_enabled") === "on", digest_time: d.get("digest_time"),
+        backup_enabled: d.get("backup_enabled") === "on", backup_time: d.get("backup_time") } });
+      box.innerHTML = `<div class="msg ok">✓ 已保存</div>`;
+    } catch (err) { box.innerHTML = `<div class="msg err">${esc(err.message)}</div>`; }
+  };
+}
+
 boot();

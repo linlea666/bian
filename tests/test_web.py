@@ -140,3 +140,49 @@ def test_password_change_rotates_session(web):
     assert c.call("GET", "/api/me")[0] == 200
     c2 = Client(c.base)
     assert c2.login("Passw0rd123")[0] == 401 and c2.login("NewPassw0rd9")[0] == 200
+
+
+def test_email_failure_chip_ignores_intentional_skips(web):
+    from bian.rules import Alert
+    from bian.web import views
+
+    app, c = web
+    store = Store(app.db_path)
+    a = Alert("R00", "info", "k", 0, "开仓", ts=__import__("time").time())
+    rid = store.add_alert(a, "x", False, "")
+    store.update_delivery(rid, False, "email: 低于邮件通知级别，未发送")
+    rid = store.add_alert(a, "x", False, "")
+    store.update_delivery(rid, False, "email: 达到每小时上限，稍后合并补发")
+    assert views.overview(store, app.settings)["email"]["last_failure"] is None  # 有意不发 ≠ 故障
+    rid = store.add_alert(a, "x", False, "")
+    store.update_delivery(rid, False, "email: SMTP 认证失败：请核对发件账号和邮箱“授权码”")
+    fail = views.overview(store, app.settings)["email"]["last_failure"]
+    assert fail and "认证失败" in fail["error"]
+
+
+def test_phase2_endpoints_and_export(web):
+    from bian.sync import ensure_leader
+
+    app, c = web
+    c.login("Passw0rd123")
+    store = Store(app.db_path)
+    ensure_leader(store, "123", "=HYPERLINK(\"x\")", "copy")
+    store.log_event("position.open", "=HYPERLINK(\"x\") 开仓", leader_id="123")
+    s, st = c.call("GET", "/api/stats?month=2026-11")
+    assert s == 200 and len(st["calendar"]["days"]) == 30 and "exits" in st
+    assert c.call("GET", "/api/stats?month=abc")[0] == 400
+    s, lst = c.call("GET", "/api/leaders")
+    assert s == 200 and lst["leaders"][0]["lead_id"] == "123"
+    assert c.call("GET", "/api/leaders/detail?id=999")[0] == 404
+    s, d = c.call("GET", "/api/leaders/detail?id=123")
+    assert s == 200 and d["profile"] is None
+    assert c.call("POST", "/api/leaders/analyze", {"id": "abc"})[0] == 400
+    s, d = c.call("POST", "/api/leaders/analyze", {"id": "123"})
+    assert s == 200 and d["queued"] is True
+    assert c.call("POST", "/api/leaders/analyze", {"id": "123"})[1]["queued"] is False
+    assert c.call("GET", "/api/episode?id=1")[0] == 404
+    assert c.call("POST", "/api/exits/manual", {"id": 1, "exit_type": "乱写"})[0] == 400
+    s, body = c.call("GET", "/api/events/export?format=csv")
+    assert s == 200 and body.startswith("﻿时间") and "'=HYPERLINK" in body
+    s, body = c.call("GET", "/api/events/export?format=json")
+    assert s == 200 and isinstance(body, list)
