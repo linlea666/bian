@@ -44,6 +44,21 @@ def run_doctor(client: Client, config_path: str | None = None, test_email: bool 
     except Exception as e:  # noqa: BLE001
         item(WARN, "fapi.binance.com（仅供参考，本工具不依赖）", f"不可访问：{getattr(e, 'code', type(e).__name__)}")
 
+    settings = None
+    if config_path and os.path.exists(config_path):
+        try:
+            from .config import load_config
+            from .settings import Settings
+
+            cfg0 = load_config(config_path)
+            db = cfg0.db_path if os.path.isabs(cfg0.db_path) else os.path.join(os.path.dirname(os.path.abspath(config_path)), cfg0.db_path)
+            if os.path.exists(db):
+                settings = Settings(db, os.path.join(os.path.dirname(db), "secrets.json"))
+        except Exception:  # noqa: BLE001
+            settings = None
+    if settings and not client.has_credentials:
+        client.set_credentials(*settings.binance_credentials())
+
     if client.has_credentials:
         try:
             if copy_account.check_auth(client):
@@ -52,22 +67,22 @@ def run_doctor(client: Client, config_path: str | None = None, test_email: bool 
             else:
                 item(FAIL, "币安登录凭证", "无效")
         except AuthExpired:
-            item(FAIL, "币安登录凭证", "已过期或无效：重新登录网页，更新 .env 里的 BINANCE_P20T / BINANCE_CSRFTOKEN")
+            item(FAIL, "币安登录凭证", "已过期或无效：登录后台 → 设置 → 币安凭证，粘贴新的 cURL")
         except BinanceError as e:
             item(FAIL, "币安登录凭证", str(e))
     else:
-        item(WARN, "币安登录凭证", "未设置：只能监控公开持仓的领航员，无法读取我的跟单仓位和总止损")
+        item(WARN, "币安登录凭证", "未设置：登录后台 → 设置 → 币安凭证（或首次引导）粘贴 cURL")
 
     from .notify import SmtpConfig, describe_smtp_error, smtp_send
 
     try:
-        smtp = SmtpConfig.from_env()
+        smtp = settings.smtp_config() if settings else SmtpConfig.from_env()
     except ValueError as e:
         smtp = None
         item(FAIL, "邮件配置", str(e))
     else:
         if not smtp:
-            item(WARN, "邮件配置", "未设置 SMTP_HOST / SMTP_USER / SMTP_PASS，不会发邮件")
+            item(WARN, "邮件配置", "未设置：登录后台 → 设置 → 邮件提醒")
         elif test_email:
             try:
                 smtp_send(smtp, "✅ 币安跟单风控：测试邮件",
@@ -85,8 +100,9 @@ def run_doctor(client: Client, config_path: str | None = None, test_email: bool 
                 from .config import load_config
 
                 cfg = load_config(config_path)
-                item(OK, "配置文件", f"{config_path}：领航员 {len(cfg.leaders)} 个（自动发现={'开' if cfg.auto_discover else '关'}），"
-                     f"亏损档位 {list(cfg.rules.loss_tiers)}（{cfg.rules.loss_tiers_mode}）")
+                tiers = settings.rules_config() if settings else cfg.rules
+                item(OK, "配置文件", f"{config_path}：后台端口 {cfg.web_port}，自动发现跟单={'开' if cfg.auto_discover else '关'}，"
+                     f"亏损档位 {list(tiers.loss_tiers)}（{tiers.loss_tiers_mode}）")
                 try:
                     db = sqlite3.connect(cfg.db_path)
                     db.execute("CREATE TABLE IF NOT EXISTS _doctor (x)")

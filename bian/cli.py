@@ -144,6 +144,88 @@ def cmd_monitor(a) -> int:
     return 0
 
 
+def _load_cfg_or_default(path: str):
+    import os
+
+    from .config import AppConfig, load_config
+
+    return load_config(path) if os.path.exists(path) else AppConfig()
+
+
+def cmd_serve(a) -> int:
+    import signal
+
+    from .app import App
+    from .store import Store
+    from .web import auth
+    from .web.server import make_server
+
+    cfg = _load_cfg_or_default(a.config)
+    if a.port:
+        cfg.web_port = a.port
+    if a.host:
+        cfg.web_host = a.host
+    app = App(cfg, data_dir=".")
+    store = Store(app.db_path)
+    if not auth.has_user(store):
+        pw = auth.random_password()
+        auth.set_password(store, "admin", pw, must_change=True)
+        print(f"已创建后台账号 admin，初始密码：{pw}（登录后请修改；也可以用 bian passwd 重置）", flush=True)
+    srv = make_server(app, cfg.web_host, cfg.web_port)
+    import threading
+
+    def _term(*_):
+        # shutdown() 会等待 serve_forever 退出，必须在另一个线程里调用，否则主线程自己等自己
+        app.stop()
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _term)
+    app.start_background()
+    print(f"风控后台已启动：http://{cfg.web_host}:{cfg.web_port}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.stop()
+        app.store.log_event("service.stop", "风控服务已停止")
+    return 0
+
+
+def cmd_passwd(a) -> int:
+    import getpass
+    import os
+
+    from .app import App  # noqa: F401  确保表结构存在
+    from .store import Store
+    from .web import auth
+
+    cfg = _load_cfg_or_default(a.config)
+    db = cfg.db_path if os.path.isabs(cfg.db_path) else os.path.join(".", cfg.db_path)
+    store = Store(db)
+    if a.if_missing and auth.has_user(store):
+        print("后台账号已存在，未修改")
+        return 0
+    if a.random or a.if_missing:
+        pw = auth.random_password()
+    else:
+        pw = getpass.getpass("新密码：")
+        if pw != getpass.getpass("再输入一次："):
+            print("两次输入不一致", file=sys.stderr)
+            return 1
+        problem = auth.password_problem(pw)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+    auth.set_password(store, a.username, pw, must_change=bool(a.random or a.if_missing))
+    store.log_event("auth.password_reset", f"命令行重置后台密码（{a.username}）")
+    if a.random or a.if_missing:
+        print(f"后台账号：{a.username}\n密码：{pw}\n（首次登录后会要求修改密码）")
+    else:
+        print("密码已修改")
+    return 0
+
+
 def cmd_doctor(a) -> int:
     from .doctor import run_doctor
 
@@ -211,6 +293,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--notify", choices=["all", "stdout"], default="all")
     p.add_argument("--once", action="store_true", help="只轮询一次（测试用）")
     p.set_defaults(fn=cmd_monitor)
+
+    p = sub.add_parser("serve", help="启动风控后台（网页 + 监控 + 凭证守护）")
+    p.add_argument("-c", "--config", default="config.toml")
+    p.add_argument("--host")
+    p.add_argument("--port", type=int)
+    p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("passwd", help="设置 / 重置后台登录密码")
+    p.add_argument("-c", "--config", default="config.toml")
+    p.add_argument("--username", default="admin")
+    p.add_argument("--random", action="store_true", help="生成随机密码并打印（首次登录需修改）")
+    p.add_argument("--if-missing", action="store_true", help="仅在还没有账号时创建（安装脚本使用）")
+    p.set_defaults(fn=cmd_passwd)
 
     p = sub.add_parser("doctor", help="部署自检：网络、凭证、邮件、配置")
     p.add_argument("-c", "--config", default="config.toml")

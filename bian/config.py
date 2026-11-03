@@ -32,6 +32,9 @@ class AppConfig:
     email: bool = True
     email_min_severity: str = "warn"  # info / warn / urgent：低于该级别的提醒不发邮件
     email_max_per_hour: int = 12
+    web_host: str = "0.0.0.0"
+    web_port: int = 3100
+    panel_url: str = ""  # 后台访问地址（写进凭证失效邮件），例如 http://1.2.3.4:3100
 
 
 def load_config(path: str) -> AppConfig:
@@ -39,6 +42,7 @@ def load_config(path: str) -> AppConfig:
         raw = tomllib.load(f)
     mon = raw.get("monitor", {})
     notify = raw.get("notify", {})
+    web = raw.get("web", {})
     cfg = AppConfig(
         poll_seconds=float(mon.get("poll_seconds", 20)),
         stale_seconds=float(mon.get("stale_seconds", 120)),
@@ -52,6 +56,9 @@ def load_config(path: str) -> AppConfig:
         email=bool(notify.get("email", True)),
         email_min_severity=str(notify.get("email_min_severity", "warn")),
         email_max_per_hour=int(notify.get("email_max_per_hour", 12)),
+        web_host=str(web.get("host", "0.0.0.0")),
+        web_port=int(web.get("port", 3100)),
+        panel_url=str(web.get("panel_url", "")),
     )
     for item in raw.get("leaders", []):
         cfg.leaders.append(LeaderConfig(

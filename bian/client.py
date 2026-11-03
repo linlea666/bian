@@ -65,6 +65,11 @@ class Client:
     def from_env(cls, **kw: Any) -> "Client":
         return cls(os.environ.get("BINANCE_P20T"), os.environ.get("BINANCE_CSRFTOKEN"), **kw)
 
+    def set_credentials(self, p20t: str | None, csrftoken: str | None) -> None:
+        """运行时更换凭证（网页更新后立即生效，不用重启）。"""
+        self.p20t = (p20t or "").strip() or None
+        self.csrftoken = (csrftoken or "").strip() or None
+
     @property
     def has_credentials(self) -> bool:
         return bool(self.p20t and self.csrftoken)

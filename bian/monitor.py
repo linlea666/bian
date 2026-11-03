@@ -37,8 +37,18 @@ class LeaderRuntime:
 
 
 class Monitor:
-    def __init__(self, cfg: AppConfig, client: Client, notifier: Notifier, store: Store, clock=time.time):
+    EQUITY_EVERY_S = 300
+
+    def __init__(self, cfg: AppConfig, client: Client, notifier: Notifier, store: Store, clock=time.time,
+                 guard=None, recorder=None, rules_provider=None):
+        """guard：CredentialGuard（凭证失效时暂停私有接口）；recorder：EpisodeRecorder（仓位回合）；
+        rules_provider(leader_id) -> RuleConfig：网页配置的阈值（支持按领航员覆盖，热更新）。"""
         self.cfg, self.client, self.notifier, self.store, self.clock = cfg, client, notifier, store, clock
+        self.guard, self.recorder = guard, recorder
+        self.rules_provider = rules_provider or (lambda pid: cfg.rules.merged(
+            next((lc.rules for lc in cfg.leaders if lc.portfolio_id == pid), None)))
+        self.last_equity_ts: dict[str, float] = {}
+        self.last_poll: dict = {}
         saved = store.load_states()
         self.states: dict[str, PosState] = {
             k: PosState.from_dict(v) for k, v in saved.items() if not k.startswith("acct:")
@@ -49,12 +59,21 @@ class Monitor:
         self.portfolio = PortfolioState()
         self.outbox: list[Outgoing] = []
         self.auth_alerted = False
-        self.leaders = [LeaderRuntime(c, cfg.rules.merged(c.rules)) for c in cfg.leaders]
+        self.leaders = [LeaderRuntime(c, self.rules_provider(c.portfolio_id)) for c in cfg.leaders]
+
+    def refresh_rules(self) -> None:
+        """网页修改阈值后调用：所有领航员按最新配置重新取规则（下一轮生效）。"""
+        for lr in self.leaders:
+            lr.rules = self.rules_provider(lr.cfg.portfolio_id)
+
+    @property
+    def private_paused(self) -> bool:
+        return bool(self.guard and self.guard.paused)
 
     # ------------------------------------------------------------- setup
     def setup(self) -> None:
         relations: dict[str, dict] = {}
-        if self.client.has_credentials:
+        if self.client.has_credentials and not self.private_paused:
             try:
                 relations = {str(r.get("leadPortfolioId")): r for r in copy_account.copy_relations(self.client)}
             except AuthExpired:
@@ -66,7 +85,7 @@ class Monitor:
             for pid, rel in relations.items():
                 if pid not in known:
                     c = LeaderConfig(portfolio_id=pid, name=str(rel.get("nickname") or ""), source="copy")
-                    self.leaders.append(LeaderRuntime(c, self.cfg.rules))
+                    self.leaders.append(LeaderRuntime(c, self.rules_provider(pid)))
         for lr in self.leaders:
             pid = lr.cfg.portfolio_id
             try:
@@ -102,39 +121,75 @@ class Monitor:
     def poll_once(self) -> list[Alert]:
         sent: list[Alert] = []
         now = self.clock()
+        t0 = time.monotonic()
+        errors: list[str] = []
         for lr in self.leaders:
             if lr.blocked_reason:
                 continue
+            if lr.source == "copy" and self.private_paused:
+                continue  # 凭证失效：不拿失效凭证反复请求；由凭证守护负责提醒
             try:
                 positions = self.fetch(lr)
-            except AuthExpired:
-                self._auth_alert()
+            except AuthExpired as e:
+                self._auth_alert(str(e))
                 sent += self._check_stale(lr, now)
                 continue
             except (RateLimited, BinanceError) as e:
                 print(f"[{lr.name}] 拉取持仓失败：{e}")
+                errors.append(f"{lr.name}: {e}")
                 sent += self._check_stale(lr, now)
                 continue
             sent += self._process(lr, positions, now)
         sent += self._accounts(now)
         sent += self._portfolio(now)
         self.flush(now)
+        self._publish_runtime(now, time.monotonic() - t0, errors)
         return sent
+
+    def _publish_runtime(self, now: float, duration: float, errors: list[str]) -> None:
+        """把最新持仓、跟单账户和心跳写进 runtime 表，供网页读取。"""
+        positions = []
+        for lr in self.leaders:
+            legs = list(lr.positions.values())
+            for p in net_by_symbol(legs):
+                st = self.states.get(p.key)
+                d = asdict(p)
+                d.update(key=p.key, leader_name=lr.name, roi=p.roi, margin=p.margin,
+                         liq_valid=p.liquidation_valid(),
+                         tier=max(st.loss.get("fired") or [-1]) + 1 if st else 0,
+                         peak_roi=st.peak_roi if st else 0.0, trough_roi=st.trough_roi if st else 0.0,
+                         first_seen=st.first_seen if st else now,
+                         legs=[{**asdict(x), "roi": x.roi, "margin": x.margin} for x in legs
+                               if x.symbol == p.symbol] if p.is_hedge else [])
+                positions.append(d)
+        self.store.set_runtime("positions", positions)
+        self.last_poll = {
+            "ts": now, "duration": round(duration, 2), "errors": errors,
+            "paused_private": self.private_paused,
+            "leaders": [{"id": lr.cfg.portfolio_id, "name": lr.name, "source": lr.source,
+                         "blocked": lr.blocked_reason, "last_ok": lr.last_ok,
+                         "positions": len(lr.positions)} for lr in self.leaders],
+        }
+        self.store.set_runtime("poll", self.last_poll)
 
     def _accounts(self, now: float) -> list[Alert]:
         """跟单账户级规则：权益回撤、原生总止损。每轮一次 detail-list 请求。"""
-        if not self.client.has_credentials or not any(lr.source == "copy" for lr in self.leaders):
+        if not self.client.has_credentials or self.private_paused:
             return []
         try:
             rels = copy_account.copy_relations(self.client)
-        except AuthExpired:
-            self._auth_alert()
+        except AuthExpired as e:
+            self._auth_alert(str(e))
             return []
         except BinanceError as e:
             print(f"读取跟单关系失败：{e}")
             return []
+        if self.guard:
+            self.guard.report_success(now, len(rels))
+        self._sync_relations(rels, now)
         by_id = {lr.cfg.portfolio_id: lr for lr in self.leaders}
         out: list[Alert] = []
+        accounts_view = []
         for r in rels:
             snap = AccountSnapshot.from_relation(r)
             lr = by_id.get(snap.lead_id)
@@ -146,12 +201,45 @@ class Monitor:
             self.accounts[key] = st
             self.store.save_state(key, st.to_dict())
             out += [self._send(a, lr) for a in alerts]
+            if now - self.last_equity_ts.get(snap.lead_id, 0) >= self.EQUITY_EVERY_S:
+                self.last_equity_ts[snap.lead_id] = now
+                self.store.add_equity(now, snap.lead_id, snap.equity, snap.invested, snap.unrealized, snap.realized)
+            dd = (st.peak_equity - snap.equity) / st.peak_equity if st.peak_equity > 0 else 0.0
+            accounts_view.append({
+                **asdict(snap), "name": lr.name, "peak_equity": st.peak_equity, "drawdown": dd,
+                "recommended_stop_u": lr.cfg.recommended_total_stop_u or round(snap.invested * lr.rules.recommend_total_stop_pct, 2),
+                "copy_mode": r.get("copyMode"), "start_date": r.get("startDate"),
+                "profit_shared": r.get("profitSharedAmount"), "positions": len(lr.positions),
+            })
+        self.store.set_runtime("accounts", accounts_view)
         return out
+
+    def _sync_relations(self, rels: list[dict], now: float) -> None:
+        """运行中发现新跟单 / 结束跟单：自动加入或移除监控（只针对自动发现的领航员）。"""
+        if not self.cfg.auto_discover:
+            return
+        live = {str(r.get("leadPortfolioId")): r for r in rels}
+        configured = {lc.portfolio_id for lc in self.cfg.leaders}
+        for pid, r in live.items():
+            if any(lr.cfg.portfolio_id == pid for lr in self.leaders):
+                continue
+            name = str(r.get("nickname") or pid)
+            c = LeaderConfig(portfolio_id=pid, name=name, source="copy")
+            lr = LeaderRuntime(c, self.rules_provider(pid), source="copy",
+                               copy_portfolio_id=str(r.get("copyPortfolioId") or ""), name=name)
+            self.leaders.append(lr)
+            self.store.log_event("leader.added", f"发现新的跟单：{name}，已加入监控", leader_id=pid, ts=now)
+        for lr in list(self.leaders):
+            pid = lr.cfg.portfolio_id
+            if lr.source == "copy" and pid not in live and pid not in configured:
+                self.leaders.remove(lr)
+                self.store.log_event("leader.removed", f"跟单已结束：{lr.name}，停止监控", leader_id=pid, ts=now)
 
     def _process(self, lr: LeaderRuntime, positions: list[Position], now: float) -> list[Alert]:
         out: list[Alert] = []
         if lr.stale_alerted:
             lr.stale_alerted = False
+            self.store.log_event("data.recovered", f"[{lr.name}] 数据已恢复", leader_id=lr.cfg.portfolio_id, ts=now)
             out.append(self._send(Alert("R08", "info", f"leader:{lr.cfg.portfolio_id}", 0,
                                         f"[{lr.name}] 数据已恢复", ts=now)))
         # 空快照二次确认：避免接口抖动被误判成“全部平仓”
@@ -178,6 +266,8 @@ class Monitor:
         self.store.add_snapshot(lr.cfg.portfolio_id, lr.source, [asdict(p) for p in positions])
 
         lr.positions = {p.key: p for p in positions}
+        if self.recorder:
+            self.recorder.observe(lr.cfg.portfolio_id, lr.name, positions, now)
         current = {p.key: p for p in net_by_symbol(positions)}  # 同币种多空合并后评估
         prefix = lr.cfg.portfolio_id + ":"
         prev_symbols = {k.split(":")[1] for k in self.states if k.startswith(prefix)}
@@ -226,6 +316,8 @@ class Monitor:
     def _check_stale(self, lr: LeaderRuntime, now: float) -> list[Alert]:
         if lr.last_ok and not lr.stale_alerted and now - lr.last_ok > self.cfg.stale_seconds:
             lr.stale_alerted = True
+            self.store.log_event("data.stale", f"[{lr.name}] 数据中断 {int(now - lr.last_ok)} 秒", "warn",
+                                 leader_id=lr.cfg.portfolio_id, ts=now)
             return [self._send(Alert(
                 "R08", "warn", f"leader:{lr.cfg.portfolio_id}", 0,
                 f"[{lr.name}] 数据已 {int(now - lr.last_ok)} 秒未更新",
@@ -269,7 +361,10 @@ class Monitor:
     def _side_cn(pos: Position) -> str:
         return {"LONG": "多", "SHORT": "空", "HEDGE": "多空对冲"}.get(pos.side, pos.side)
 
-    def _auth_alert(self) -> None:
+    def _auth_alert(self, reason: str = "") -> None:
+        if self.guard:
+            self.guard.report_failure(reason or "鉴权失败", self.clock())
+            return
         if not self.auth_alerted:
             self.auth_alerted = True
             self._send(Alert("AUTH", "urgent", "auth", 0, "币安登录凭证失效",
@@ -314,14 +409,26 @@ class Monitor:
         msg = self.format(a, lr, pos)
         row_id = self.store.add_alert(a, msg, False, "待发送")
         self.outbox.append(Outgoing(row_id, msg, a.severity, a.ts or self.clock()))
+        leader_id = lr.cfg.portfolio_id if lr else None
+        ep_ids = []
+        if self.recorder and lr and pos:
+            ep_ids = self.recorder.note_alert(leader_id, pos.symbol, a.rule_id, row_id)
+        prefix = ""
+        if lr and not a.title.startswith("["):
+            prefix = f"[{lr.name}] " + (f"{pos.symbol} {self._side_cn(pos)} ｜" if pos else "")
+        self.store.log_event(f"alert.{a.rule_id}", prefix + a.title,
+                             a.severity, leader_id=leader_id, episode_id=ep_ids[0] if len(ep_ids) == 1 else None,
+                             ref=f"alert:{row_id}", ts=a.ts or self.clock(), key=a.key,
+                             suggestion=a.suggestion, episodes=ep_ids)
         return a
 
     def flush(self, now: float | None = None) -> None:
         items, self.outbox = self.outbox, []
         for it, ok, err in deliver_all(self.notifier, items, now if now is not None else self.clock()):
             self.store.update_delivery(it.row_id, ok, err)
-            if not ok:
+            if not ok and "低于邮件通知级别" not in err:
                 print(f"通知未送达（已记录，可能稍后重试）：{err}")
+                self.store.log_event("notify.failed", f"提醒未送达：{err[:120]}", "warn", ref=f"alert:{it.row_id}")
 
     def run(self) -> None:
         self.setup()
