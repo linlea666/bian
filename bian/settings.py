@@ -58,6 +58,7 @@ DEFAULTS: dict = {
         "email_events": list(DEFAULT_EVENTS),  # 哪些事件发邮件（其余只在后台记录，并进每日摘要）
         "email_batch_minutes": 60,  # 非紧急提醒攒多久汇总一封；0 = 立即发。紧急的始终立即发
         "email_max_per_hour": 6,
+        "leader_actions": {},  # 领航员 ID -> 是否发开仓 / 加仓 / 减仓 / 平仓邮件；没设置的跟随全局
         "smtp_host": "smtp.163.com",
         "smtp_port": 465,
         "smtp_security": "",
@@ -88,7 +89,7 @@ SECRET_KEYS = ("binance_p20t", "binance_csrftoken", "smtp_pass")
 def _deep_merge(base: dict, patch: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in patch.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict) and k != "leader_rules":
+        if isinstance(v, dict) and isinstance(out.get(k), dict) and k not in ("leader_rules", "leader_actions"):
             out[k] = _deep_merge(out[k], v)
         else:
             out[k] = copy.deepcopy(v)
@@ -154,6 +155,9 @@ def validate(cfg: dict) -> dict:
     if not isinstance(events, list) or any(e not in EVENT_KEYS for e in events):
         raise SettingsError("发邮件的事件不合法")
     n["email_events"] = [k for k in EVENT_KEYS if k in events]  # 去重、固定顺序
+    la = n.get("leader_actions")
+    if not isinstance(la, dict) or any(not str(k).isdigit() or not isinstance(v, bool) for k, v in la.items()):
+        raise SettingsError("按领航员的交易动作邮件设置不合法")
     n["email_batch_minutes"] = int(float(n["email_batch_minutes"]))
     if not 0 <= n["email_batch_minutes"] <= 240:
         raise SettingsError("汇总间隔应在 0–240 分钟之间")

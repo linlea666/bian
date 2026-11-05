@@ -553,6 +553,7 @@ function emailForm() {
         <label class="chk muted"><input type="checkbox" checked disabled> 币安凭证失效（始终发送）</label></div>
       <div class="hint">没勾选的只在后台“记录 → 提醒记录”里保存，并在每日摘要里汇总条数。同一事件当天只发一次，明显恶化（例如亏损跌到下一档、回撤再加深 5 个点）才会再发。</div>
     </fieldset>
+    ${leaderActionsBox(n)}
     <div class="row">
       <label class="f"><span>非紧急提醒汇总间隔（分钟）</span><input name="email_batch_minutes" type="number" min="0" max="240" value="${esc(n.email_batch_minutes)}"><div class="hint">攒够这么久合并成一封；紧急的立即发并顺带捎上。0 = 每次立即发</div></label>
       <label class="f"><span>每小时最多几封</span><input name="email_max_per_hour" type="number" min="1" max="120" value="${esc(n.email_max_per_hour)}"><div class="hint">兜底上限，超出的合并到下一封</div></label>
@@ -562,11 +563,25 @@ function emailForm() {
     <p class="hint">阿里云等云服务器默认封禁 25 端口，请用 465 或 587。测试邮件使用表单里的内容，不会保存。</p>
   </form>`;
 }
+/* 按领航员单独设置交易动作（开仓 / 加仓 / 减仓 / 平仓）邮件：优先于上面的全局勾选 */
+function leaderActionsBox(n) {
+  const la = n.leader_actions || {};
+  const names = Object.fromEntries((S.settings.leaders || []).map((l) => [l.id, l.name]));
+  const ids = [...new Set([...(S.settings.leaders || []).map((l) => l.id), ...Object.keys(la)])];
+  if (!ids.length) return "";
+  const val = (id) => (la[id] === true ? "on" : la[id] === false ? "off" : "");
+  return `<fieldset><legend>按领航员单独设置交易动作邮件</legend>
+    <div class="hint">开仓 / 加仓 / 减仓 / 平仓这四种提醒：单独设置的领航员以这里为准，其余跟随上面的全局勾选。亏损档位、强平等风险提醒不受影响。</div>
+    <div class="ev-grid">${ids.map((id) => `<label class="f"><span>${esc(names[id] || id)}</span><select data-la="${esc(id)}">
+      <option value="" ${val(id) === "" ? "selected" : ""}>跟随全局</option><option value="on" ${val(id) === "on" ? "selected" : ""}>发邮件</option>
+      <option value="off" ${val(id) === "off" ? "selected" : ""}>不发</option></select></label>`).join("")}</div></fieldset>`;
+}
 function emailPayload(f) {
   const d = new FormData(f);
   const p = { notify: { email_enabled: d.get("email_enabled") === "on", smtp_host: d.get("smtp_host").trim(), smtp_port: Number(d.get("smtp_port") || 465),
     smtp_security: d.get("smtp_security"), smtp_user: d.get("smtp_user").trim(), smtp_to: d.get("smtp_to").trim(),
     email_events: (S.settings.email_event_groups || []).map((g) => g.key).filter((k) => d.get("ev_" + k) === "on"),
+    leader_actions: Object.fromEntries([...f.querySelectorAll("[data-la]")].filter((el) => el.value !== "").map((el) => [el.dataset.la, el.value === "on"])),
     email_batch_minutes: Number(d.get("email_batch_minutes") || 0), email_max_per_hour: Number(d.get("email_max_per_hour") || 6) } };
   if (d.get("smtp_pass")) p.smtp_pass = d.get("smtp_pass");
   return p;

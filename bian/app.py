@@ -46,13 +46,14 @@ class App:
         n = cfg["notify"]
         smtp = self.settings.smtp_config(cfg) if n["email_enabled"] else None
         key = (smtp and (smtp.host, smtp.port, smtp.user, smtp.password, tuple(smtp.to), smtp.security),
-               tuple(n["email_events"]), n["email_batch_minutes"], n["email_max_per_hour"])
+               tuple(n["email_events"]), n["email_batch_minutes"], n["email_max_per_hour"],
+               tuple(sorted(n["leader_actions"].items())))
         if key != self._notifier_key:
             old = self._email()
             parts = [StdoutNotifier()]
             if smtp:
                 em = EmailNotifier(smtp, max_per_hour=n["email_max_per_hour"], events=n["email_events"],
-                                   batch_minutes=n["email_batch_minutes"])
+                                   batch_minutes=n["email_batch_minutes"], leader_actions=n["leader_actions"])
                 if old:  # 改设置不能丢掉正在等待合并的提醒（按旧设置已决定要发）和本小时的发送计数
                     em.pending = list(old.pending)
                     em.sent_times, em.retry_at = old.sent_times, old.retry_at
@@ -69,13 +70,14 @@ class App:
         """服务重启后，把还在排队（等待合并 / 每小时上限 / 等待重试）的邮件提醒放回队列；
         超过 6 小时的不再补发，标记为过期。返回恢复的条数。"""
         rows = store.db.execute(
-            "SELECT id, ts, rule_id, severity, message FROM alerts WHERE delivered=0 AND error LIKE '%email:%' "
+            "SELECT id, ts, rule_id, severity, message, key FROM alerts WHERE delivered=0 AND error LIKE '%email:%' "
             "AND (error LIKE ? OR error LIKE '%达到每小时上限%' OR error LIKE '%等待重试%') ORDER BY id",
             (f"%{HELD}%",)).fetchall()
         em, now, n = self._email(), self.clock(), 0
-        for rid, ts, rule_id, sev, msg in rows:
+        for rid, ts, rule_id, sev, msg, key in rows:
             if em and now - (ts or 0) < self.HELD_RESTORE_S:
-                em.requeue([Outgoing(rid, msg or "", sev, ts or now, rule_id or "")])
+                lid = (key or "").split(":")[0]  # 仓位提醒的 key 是 “领航员ID:币种:方向”
+                em.requeue([Outgoing(rid, msg or "", sev, ts or now, rule_id or "", lid if lid.isdigit() else "")])
                 n += 1
             else:
                 store.update_delivery(rid, False, "email: 服务重启，已过期未发送")

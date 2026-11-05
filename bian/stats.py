@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import calendar as _cal
+from datetime import date as _date
 import json
 import time
 
@@ -135,9 +136,13 @@ def losses(store, limit: int = 10) -> dict:
     dist = [{"range": n, "count": sum(1 for p in pnls if lo <= (p or 0) < hi)} for n, (lo, hi) in zip(names, buckets)]
     days = daily_realized(store, 0, time.time() + 1)
     streak = best = 0
+    prev = None
     for d in sorted(days):
+        cur = _date.fromisoformat(d)
+        if prev is None or (cur - prev).days != 1:
+            streak = 0  # 中间隔了没有交易的日子：连续中断（按日历天算“连续”）
         streak = streak + 1 if days[d]["net"] < 0 else 0
-        best = max(best, streak)
+        best, prev = max(best, streak), cur
     return {"worst": worst, "distribution": dist, "max_loss_streak_days": best, "closed_n": len(pnls)}
 
 

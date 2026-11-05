@@ -474,7 +474,8 @@ class Monitor:
         """写入审计表并放进发件箱；本轮结束时由 flush() 统一投递（邮件会合并成一封）。"""
         msg = self.format(a, lr, pos)
         row_id = self.store.add_alert(a, msg, False, "待发送")
-        self.outbox.append(Outgoing(row_id, msg, a.severity, a.ts or self.clock(), a.rule_id))
+        self.outbox.append(Outgoing(row_id, msg, a.severity, a.ts or self.clock(), a.rule_id,
+                                    lr.cfg.portfolio_id if lr else ""))
         leader_id = lr.cfg.portfolio_id if lr else None
         ep_ids = []
         if self.recorder and lr and pos:

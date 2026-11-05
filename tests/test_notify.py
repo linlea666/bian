@@ -219,3 +219,19 @@ def test_replay_screenshot_window_sends_at_most_three_mails():
         em.deliver([], now=t0 + minute * 60)
     assert [r for _, r, _ in alerts].count("A01b") == 1 and [r for _, r, _ in alerts].count("R09") == 1
     assert len(rec.mails) <= 3
+
+
+def test_leader_action_switch_overrides_global():
+    """交易动作（开仓 / 加仓 / 减仓 / 平仓）按领航员单独开关优先；风险提醒不受影响。"""
+    rec = Recorder()
+    em = EmailNotifier(CFG, events=notify.DEFAULT_EVENTS, sender=rec, leader_actions={"111": True, "222": False})
+    items = [Outgoing(1, "a", "info", 0, "R00", "111"), Outgoing(2, "b", "info", 0, "R11", "111"),
+             Outgoing(3, "c", "info", 0, "R00", "333"),  # 没设置：跟随全局（默认不发）
+             Outgoing(4, "d", "warn", 0, "R07", "222"), Outgoing(5, "e", "warn", 0, "R07L", "222"),  # 风险提醒照常
+             Outgoing(6, "f", "warn", 0, "L1", "222")]
+    sent = {it.row_id for it, ok, _ in em.deliver(items, now=10) if ok}
+    assert sent == {1, 2, 5, 6}
+    em2 = EmailNotifier(CFG, events=notify.EVENT_KEYS, sender=Recorder(), leader_actions={"222": False})
+    sent = {it.row_id for it, ok, _ in em2.deliver([Outgoing(7, "g", "info", 0, "R07b", "222"),
+                                                   Outgoing(8, "h", "info", 0, "R07b", "333")], now=10) if ok}
+    assert sent == {8}  # 全局都发，单独关闭的领航员不发

@@ -124,3 +124,14 @@ def test_upgrade_old_notify_and_rules(tmp_path):
         st.update({"notify": {"email_events": ["loss_tier", "nope"]}})
     new, changed = st.update({"notify": {"email_events": ["liquidation", "loss_tier"], "email_batch_minutes": 0}})
     assert new["notify"]["email_events"] == ["loss_tier", "liquidation"] and "notify.email_events" in changed
+
+
+def test_leader_actions_setting(tmp_path):
+    st = Settings(str(tmp_path / "a.db"), str(tmp_path / "s.json"))
+    cfg, _ = st.update({"notify": {"leader_actions": {"111": True, "222": False}}})
+    assert cfg["notify"]["leader_actions"] == {"111": True, "222": False}
+    cfg, _ = st.update({"notify": {"leader_actions": {"222": False}}})  # 改回“跟随全局”：整体替换，不残留
+    assert cfg["notify"]["leader_actions"] == {"222": False}
+    for bad in ({"abc": True}, {"111": "yes"}):
+        with pytest.raises(SettingsError):
+            st.update({"notify": {"leader_actions": bad}})

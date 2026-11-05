@@ -45,6 +45,7 @@ EVENT_KEYS = [g[0] for g in EVENT_GROUPS]
 DEFAULT_EVENTS = [g[0] for g in EVENT_GROUPS if g[3]]
 URGENT_EVENTS = ["loss_tier", "account_dd", "liquidation", "profit_to_loss", "native_stop", "portfolio"]
 ALWAYS_EMAIL = ("AUTH",)  # 凭证失效：始终发，不可关闭
+ACTION_RULES = ("R00", "R07", "R07b", "R11")  # 交易动作：开仓 / 加仓 / 减仓 / 平仓（可按领航员单独开关）
 
 
 def event_group(rule_id: str) -> str:
@@ -79,6 +80,7 @@ class Outgoing:
     severity: str = "info"
     created: float = field(default_factory=time.time)
     rule_id: str = ""  # 决定是否发邮件（按事件分组）
+    leader_id: str = ""  # 交易动作按领航员单独开关时用
 
 
 Result = tuple[Outgoing, bool, str]  # (提醒, 是否送达, 说明/错误)
@@ -238,9 +240,10 @@ class EmailNotifier(Notifier):
 
     def __init__(self, cfg: SmtpConfig, min_severity: str = "warn", max_per_hour: int = 6,
                  retry_seconds: float = 300, max_pending: int = 200, sender=smtp_send, clock=time.time,
-                 events=None, batch_minutes: float = 0):
+                 events=None, batch_minutes: float = 0, leader_actions: dict | None = None):
         self.cfg, self.min_level = cfg, LEVEL.get(min_severity, 1)
         self.events = set(events) if events is not None else None
+        self.leader_actions = dict(leader_actions or {})  # 领航员 ID -> 是否发交易动作邮件（优先于全局）
         self.batch_s = max(0.0, float(batch_minutes)) * 60
         self.max_per_hour, self.retry_seconds, self.max_pending = max_per_hour, retry_seconds, max_pending
         self._send_mail, self.clock = sender, clock
@@ -252,6 +255,8 @@ class EmailNotifier(Notifier):
     def allows(self, it: Outgoing) -> bool:
         if it.rule_id in ALWAYS_EMAIL:
             return True
+        if it.rule_id in ACTION_RULES and it.leader_id in self.leader_actions:
+            return bool(self.leader_actions[it.leader_id])  # 按领航员单独设置的交易动作开关优先
         if self.events is not None:
             return event_group(it.rule_id) in self.events
         return LEVEL.get(it.severity, 0) >= self.min_level
