@@ -193,3 +193,37 @@ def test_liquidation_once_per_day_unless_halved():
     assert "R09" not in ids(al)
     st, al = evaluate(lp(0.97), st, CFG, 2800)  # 2.1%：减半以内
     assert "R09" in ids(al)
+
+
+def test_principal_out_when_profit_doubles():
+    """利润翻倍提醒取回本金：每个整数倍只提醒一次；本金取出后不再提醒；可关闭。"""
+    st, al = evaluate_account(acct(570, stop_u=100, trigger=100), None, CFG, 0)  # 1.9 倍
+    assert "A05" not in ids(al)
+    st, al = evaluate_account(acct(620, stop_u=100, trigger=100), st, CFG, 10)  # 2.07 倍
+    (a,) = [x for x in al if x.rule_id == "A05"]
+    assert a.severity == "warn" and "2.1 倍" in a.title and "300U 本金" in a.suggestion
+    for t, eq in ((20, 640), (30, 610), (86400 * 3, 650)):
+        st, al = evaluate_account(acct(eq, stop_u=100, trigger=100), st, CFG, t)
+        assert "A05" not in ids(al)  # 一直在 2 倍附近：不重复
+    st, al = evaluate_account(acct(910, stop_u=100, trigger=100), st, CFG, 86400 * 4)  # 3 倍
+    assert "A05" in ids(al)
+    # 取出本金：净投入变成 10U（权益的 20% 以下）→ 不再提醒
+    st, al = evaluate_account(acct(610, invested=10, stop_u=100, trigger=100), st, CFG, 86400 * 5)
+    assert "A05" not in ids(al)
+    off = CFG.merged({"principal_out_multiple": 0})
+    _, al = evaluate_account(acct(900), None, off, 0)
+    assert "A05" not in ids(al)
+
+
+def test_principal_out_is_key_email_event_and_todo():
+    from bian import notify
+    from bian.web.views import build_todos
+    assert notify.event_group("A05") == "principal_out" and "principal_out" in notify.DEFAULT_EVENTS
+    a = {"lead_id": "L", "name": "甲", "equity": 620.0, "invested": 300.0, "drawdown": 0.0, "peak_equity": 620.0,
+         "native_stop_u": 100, "recommended_stop_u": 60, "principal_multiple": 2.07}
+    ctx = {"accounts": [a], "positions": [], "cred": {"state": "valid"}, "poll": {}, "done": set(), "smtp_ok": True,
+           "settings": {"rules": {"account_dd_warn": 0.1, "account_dd_severe": 0.2}}}
+    todos = build_todos(ctx)
+    assert any("本金取出来" in t["title"] for t in todos)
+    ctx["done"] = {t["key"] for t in todos}
+    assert build_todos(ctx) == []

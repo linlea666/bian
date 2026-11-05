@@ -35,6 +35,7 @@ EVENT_GROUPS: list[tuple[str, str, tuple[str, ...], bool]] = [
     ("residual", "残留仓位（领航员已平、你还在）", ("R12",), True),
     ("add_in_loss", "亏损中还在加仓（摊平扛单）", ("R07L",), True),
     ("system", "无法监控 / 数据中断", ("R08",), True),
+    ("principal_out", "利润翻倍，建议取回本金", ("A05",), True),
     ("trail", "浮盈回撤", ("R05",), False),
     ("add", "领航员加仓", ("R07",), False),
     ("tp_ladder", "分批止盈到位", ("R13",), False),

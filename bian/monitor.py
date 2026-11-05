@@ -12,7 +12,7 @@ from .models import Position
 from .notify import Notifier, Outgoing, deliver_all, is_soft
 from .sync import mark_copy_set
 from .rules import (
-    AccountSnapshot, AccountState, Alert, PortfolioState, PosState, RuleConfig,
+    AccountSnapshot, AccountState, Alert, PortfolioState, PosState, RuleConfig, principal_multiple,
     evaluate, evaluate_account, evaluate_portfolio,
 )
 from .store import Store
@@ -224,6 +224,7 @@ class Monitor:
                 "recommended_stop_u": lr.cfg.recommended_total_stop_u or round(snap.invested * lr.rules.recommend_total_stop_pct, 2),
                 "copy_mode": r.get("copyMode"), "start_date": r.get("startDate"),
                 "profit_shared": r.get("profitSharedAmount"), "positions": len(lr.positions),
+                "principal_multiple": principal_multiple(snap, lr.rules),  # 利润翻倍待办用（按领航员设置）
             })
         self.store.set_runtime("accounts", accounts_view)
         return out

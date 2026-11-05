@@ -35,6 +35,7 @@ const HELP = {
   rec_stop: "跟单总止损比例：他近 90 天最大回撤 × 1.2。正常波动不会触发，真失控时由币安自动全部平仓兜底。采用后，作战室里“建议总止损金额”按这个比例计算，需要你在币安自己设置。",
   profit_guard: "盈利保护：浮盈达到一定比例后，把止损挪到保本价；再从最高浮盈回落若干个点时止盈。推荐的方案来自回测全组合：用前 70% 历史选出，在后 30% 和全部历史上都比原始跟单好才推荐。",
   ladder: "分批止盈阶梯：按他盈利单通常能涨到的浮盈（中位数 / 75% 分位）分批止盈，和“不止盈”对比。只有用前 70% 的历史选出、在后 30% 也更好的方案才推荐。采用后浮盈到位时提醒你在币安手动止盈（默认不发邮件）。",
+  principal: "利润翻倍取回本金：跟单权益达到净投入的这个倍数时（例如 2 倍 = 利润翻倍），提醒你在币安把本金取出来，剩下的都是利润，继续跑也不会再亏本。每个整数倍（2 倍、3 倍…）只提醒一次；本金取出后不再提醒。",
   ended: "已停止跟单：你在币安已经不再跟这个领航员。数据默认一直保留；可以导出备份，或删除他的全部数据（删除前会自动备份一份到服务器）。",
 };
 const help = (k) => HELP[k] ? `<span class="help" data-help="${k}" tabindex="0" role="button" aria-label="说明">?</span>` : "";
@@ -655,6 +656,7 @@ const RULE_GROUPS = [
     ["account_dd_severe", "权益回撤紧急线", "pct", "drawdown"],
     ["recommend_total_stop_pct", "建议总止损 = 净投入 ×", "pct", "native_stop"],
     ["native_stop_near_pct", "离总止损触发还剩多少时提醒", "pct", null, "占总止损额的比例"],
+    ["principal_out_multiple", "权益达到本金几倍时提醒取回本金", "num", "principal", "倍，2 = 利润翻倍；0 = 关闭"],
     ["liq_distance_pct", "离强平价多近时紧急提醒", "pct"]]],
 ];
 function ruleInput(r, [key, label, type, h, hint], prefix = "r_") {
@@ -681,9 +683,9 @@ function readRules(f, prefix = "r_", only) {
   return out;
 }
 const OVERRIDE_KEYS = ["loss_tiers", "loss_tiers_mode", "min_alert_u", "recommend_total_stop_pct",
-  "breakeven_trigger_roi", "trail_trigger_roi", "trail_gap_roi"];
+  "breakeven_trigger_roi", "trail_trigger_roi", "trail_gap_roi", "principal_out_multiple"];
 const OV_NAMES = { loss_tiers: "亏损档位", loss_tiers_mode: "档位方式", min_alert_u: "金额门槛", recommend_total_stop_pct: "建议总止损比例", tp_ladder: "分批止盈",
-  breakeven_trigger_roi: "保本提醒门槛", trail_trigger_roi: "盯回撤门槛", trail_gap_roi: "回落多少提醒" };
+  breakeven_trigger_roi: "保本提醒门槛", trail_trigger_roi: "盯回撤门槛", trail_gap_roi: "回落多少提醒", principal_out_multiple: "取回本金倍数" };
 const ladderText = (lv) => (lv || []).map(([r, f]) => `+${Math.round(r * 100)}% 平 ${Math.abs(f - 1 / 3) < 1e-6 ? "1/3" : Math.round(f * 100) + "%"}`).join(" → ");
 function fmtOv(k, v) {
   if (k === "tp_ladder") return ladderText(v) || "关闭";

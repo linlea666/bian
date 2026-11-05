@@ -145,6 +145,8 @@ def validate(cfg: dict) -> dict:
         (0 <= float(r["min_alert_u"]) <= 10000, "最小提醒金额应在 0–10000U 之间"),
         (0 < float(r["account_dd_warn"]) < float(r["account_dd_severe"]) < 1, "账户回撤：提醒线要小于紧急线，且都在 0–100% 之间"),
         (0 < float(r["recommend_total_stop_pct"]) < 1, "建议总止损比例应在 0–100% 之间"),
+        (float(r["principal_out_multiple"]) == 0 or 1.2 <= float(r["principal_out_multiple"]) <= 100,
+         "取回本金倍数应为 0（关闭）或 1.2–100 倍"),
     ]
     for ok, msg in checks:
         if not ok:

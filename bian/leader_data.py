@@ -25,7 +25,7 @@ TABLES: list[tuple[str, str, int]] = [
     ("equity", "leader_id=?", 1),
     ("snapshots", "leader_id=?", 1),
     ("state", "key LIKE ? OR key=?", 2),
-    ("todos_done", "key LIKE ? OR key LIKE ? OR key=? OR key=?", 4),
+    ("todos_done", "key LIKE ? OR key LIKE ? OR key=? OR key=? OR key LIKE ?", 5),
     ("leader_history", "lead_id=?", 1),
     ("leader_profiles", "lead_id=?", 1),
     ("jobs", "lead_id=?", 1),
@@ -36,7 +36,8 @@ def _params(table: str, lid: str) -> tuple:
     return {
         "alerts": (f"{lid}:%", f"acct:{lid}", f"leader:{lid}"),
         "state": (f"{lid}:%", f"acct:{lid}"),
-        "todos_done": (f"pos:{lid}:%", f"acct:dd:{lid}:%", f"acct:nostop:{lid}", f"leader:blocked:{lid}"),
+        "todos_done": (f"pos:{lid}:%", f"acct:dd:{lid}:%", f"acct:nostop:{lid}", f"leader:blocked:{lid}",
+                       f"acct:principal:{lid}:%"),
     }.get(table, (lid,))
 
 

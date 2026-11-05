@@ -85,6 +85,10 @@ def build_todos(ctx: dict) -> list[dict]:
             add(f"acct:dd:{a['lead_id']}:{lvl}", lvl, f"{a['name']} 跟单权益回撤 {a['drawdown'] * 100:.1f}%",
                 f"权益 {a['equity']:.2f}U（最高 {a['peak_equity']:.2f}U）。考虑暂停这个跟单或减仓。",
                 "去币安", LEAD_URL.format(a["lead_id"]))
+        if a.get("principal_multiple"):
+            add(f"acct:principal:{a['lead_id']}:{a['invested']:.0f}", "yellow", f"把 {a['name']} 的本金取出来",
+                f"权益 {a['equity']:.2f}U，已是本金 {a['invested']:.2f}U 的 {a['principal_multiple']:.1f} 倍。取出本金后，剩下的利润继续跑，不再亏本。",
+                "去币安", COPY_MGMT_URL)
         if not a.get("native_stop_u"):
             add(f"acct:nostop:{a['lead_id']}", "yellow", f"给 {a['name']} 设置跟单总止损",
                 f"净投入 {a['invested']:.0f}U，建议总止损约 {a['recommended_stop_u']:.0f}U。这是币安原生功能，由交易所自动执行。",

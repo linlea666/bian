@@ -37,6 +37,7 @@ class RuleConfig:
     account_dd_step: float = 0.05  # 当天已提醒过：回撤再加深 5 个点才再提醒
     recommend_total_stop_pct: float = 0.20  # 未设原生总止损时，建议的止损额 = 净投入 × 该比例
     native_stop_near_pct: float = 0.30  # 距原生总止损触发只剩止损额的 30% 时提醒
+    principal_out_multiple: float = 2.0  # A05：权益达到净投入的几倍（2 = 利润翻倍）时提醒取回本金；0 = 关闭
     # ---- 分批止盈阶梯（R13，第三期）：((浮盈 ROI, 平仓比例), ...)；空 = 不提醒。一般在领航员页“采用”推荐后按领航员设置
     tp_ladder: tuple = ()
 
@@ -359,6 +360,14 @@ class AccountState:
         return cls(**{k: v for k, v in d.items() if k in {f.name for f in fields(cls)}})
 
 
+def principal_multiple(a: "AccountSnapshot", cfg: RuleConfig) -> float | None:
+    """权益是净投入的几倍；没达到提醒倍数、功能关闭、或本金已取出（净投入 < 权益的 20%）时返回 None。"""
+    if cfg.principal_out_multiple <= 0 or a.invested <= 0 or a.invested < a.equity * 0.2:
+        return None
+    m = a.equity / a.invested
+    return m if m >= cfg.principal_out_multiple else None
+
+
 def evaluate_account(
     a: AccountSnapshot, st: AccountState | None, cfg: RuleConfig, now: float, recommended_stop_u: float = 0.0
 ) -> tuple[AccountState, list[Alert]]:
@@ -414,6 +423,19 @@ def evaluate_account(
                 f"触发后处理方式 {a.disposal}",
                 "交易所会按设置自动处理；如不希望全部平仓，请提前手动减仓")
             _note(shim, "A03", now, room)
+
+    # ---- A05 利润翻倍：建议取回本金，让利润继续跑。同一份净投入每个整数倍只提醒一次（2 倍、3 倍…）；
+    # 净投入只剩权益的 20% 以下（本金已取出）不再提醒；追加 / 赎回后版本变化，自动重新判断
+    m = principal_multiple(a, cfg)
+    if m:
+        f = shim.fired.get("A05")
+        done = f.get("level", 0) if f and f.get("version") == shim.version else 0
+        if int(m) > done:
+            add("A05", "warn", f"利润翻倍：跟单权益 {a.equity:.2f}U，已是本金 {a.invested:.2f}U 的 {m:.1f} 倍",
+                f"{detail}",
+                f"在币安该跟单的“调整资金 / 赎回”里取出约 {a.invested:.0f}U 本金，让 {a.equity - a.invested:.0f}U 利润继续跑；"
+                "有持仓时可取余额可能不够，可以分批取，或等仓位少的时候再取")
+            shim.fired["A05"] = {"version": shim.version, "ts": now, "level": int(m)}
 
     if a.is_paused and _can_fire(shim, "A04", now, 24 * 3600):
         add("A04", "info", "该跟单处于暂停状态（不会跟新仓，已有仓位仍在）")
