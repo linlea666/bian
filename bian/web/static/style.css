@@ -268,3 +268,11 @@ select.sm-sel { width: auto; padding: 3px 6px; font-size: 12px; }
 .danger-zone { border-color: color-mix(in srgb, var(--red) 40%, var(--line)); }
 .card-h { flex-wrap: wrap; }  /* 标题右侧按钮多时换行（手机） */
 fieldset { min-width: 0; }  /* 浏览器默认 min-width: min-content，会被里面的长内容撑宽 */
+
+/* ---------- 交易所账户 ---------- */
+.ex-card + .ex-card, #exAdd + .ex-card, .card-h + .ex-card { margin-top: 12px; }
+.ex-kv { grid-template-columns: max-content 1fr max-content 1fr; }
+.sm-chk { margin: 0 4px; font-size: 13px; }
+.stat-src { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+.stat-src select { width: auto; }
+@media (max-width: 700px) { .ex-kv { grid-template-columns: max-content 1fr; } }

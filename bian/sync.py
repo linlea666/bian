@@ -147,3 +147,23 @@ def sync_leader_history(client: Client, store, lead_id: str, max_pages: int = 30
     store.db.execute("UPDATE leaders SET history_synced=?, history_ok=? WHERE lead_id=?", (now, now, lead_id))
     store.db.commit()
     return total
+
+
+# ---------------------------------------------------------------- 交易所账户资金流水
+LEDGER_BACKFILL_S = 90 * 86400  # 首次回补近 3 个月（两家交易所接口都只保留约 3 个月）
+
+
+def sync_account_ledger(store, adapter, account_id: str, now: float | None = None) -> int:
+    """增量同步资金流水：从已有的最后一条往后（首次回补 3 个月），按 uid 去重。返回新增条数。"""
+    now = now or time.time()
+    last = store.db.execute("SELECT MAX(ts_ms) FROM account_ledger WHERE account_id=?", (account_id,)).fetchone()[0]
+    since = int(last) if last else int((now - LEDGER_BACKFILL_S) * 1000)
+    rows = adapter.ledger(since, int(now * 1000))
+    new = 0
+    for r in rows:
+        cur = store.db.execute("INSERT OR IGNORE INTO account_ledger (uid, account_id, ts_ms, kind, symbol, amount) "
+                               "VALUES (?,?,?,?,?,?)", (r.uid, account_id, r.ts_ms, r.kind, r.symbol, r.amount))
+        new += cur.rowcount
+    store.db.execute("UPDATE exchange_accounts SET ledger_synced=? WHERE id=?", (now, account_id))
+    store.db.commit()
+    return new

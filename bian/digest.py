@@ -4,6 +4,7 @@ from __future__ import annotations
 import time
 
 from . import exits, stats
+from .exchanges import EXCHANGES
 from .notify import EVENT_GROUPS, SKIPPED, event_group
 from .web import views
 
@@ -42,8 +43,15 @@ def build(store, settings, now: float | None = None) -> tuple[str, str]:
         trades = sum(x["trades"] for x in r.values())
         if trades:
             rows.append(f"  · {name}：{n:+.2f}U（平仓 {trades} 笔）")
+    for a in store.db.execute("SELECT id, exchange, name FROM exchange_accounts WHERE removed=0 ORDER BY created"):
+        r = stats.daily_realized(store, y_start, y_end, a[0])
+        if r:
+            n = sum(x["net"] for x in r.values())
+            fu = sum(x["funding"] for x in r.values())
+            rows.append(f"  · {EXCHANGES.get(a[1], a[1])} · {a[2]}（交易所账户）：{n:+.2f}U"
+                        + (f"（含资金费 {fu:+.2f}U）" if fu else ""))
     if rows:
-        lines.append("各领航员昨日：")
+        lines.append("各领航员 / 账户昨日：")
         lines += rows
         lines.append("")
     ex = exits.summary(store, y_start)

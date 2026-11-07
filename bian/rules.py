@@ -37,6 +37,8 @@ class RuleConfig:
     account_dd_step: float = 0.05  # 当天已提醒过：回撤再加深 5 个点才再提醒
     recommend_total_stop_pct: float = 0.20  # 未设原生总止损时，建议的止损额 = 净投入 × 该比例
     native_stop_near_pct: float = 0.30  # 距原生总止损触发只剩止损额的 30% 时提醒
+    margin_ratio_warn: float = 0.50  # A06 交易所账户维持保证金率达到 50% 提醒（100% 爆仓）
+    margin_ratio_severe: float = 0.80  # 达到 80% 紧急
     principal_out_multiple: float = 2.0  # A05：权益达到净投入的几倍（2 = 利润翻倍）时提醒取回本金；0 = 关闭
     # ---- 分批止盈阶梯（R13，第三期）：((浮盈 ROI, 平仓比例), ...)；空 = 不提醒。一般在领航员页“采用”推荐后按领航员设置
     tp_ladder: tuple = ()
@@ -100,6 +102,7 @@ class PosState:
     # 亏损分档状态：不随加仓版本重置（避免领航员边亏边加时反复通知）
     loss: dict = field(default_factory=lambda: {"fired": [], "last_ts": 0.0, "day": "", "day_count": 0, "top_ts": 0.0})
     first_seen: float = 0.0
+    version_ts: float = 0.0  # 当前版本开始的时间（加 / 减仓后更新；R14 留 2 分钟给你挂止损单）
     last_seen: float = 0.0
 
     def to_dict(self) -> dict:
@@ -187,6 +190,7 @@ def evaluate(
     elif pos.qty > 0 and st.qty > 0 and abs(pos.qty - st.qty) / st.qty > cfg.add_threshold:
         increased = pos.qty > st.qty
         st.version += 1
+        st.version_ts = now
         st.peak_roi = max(roi, 0.0)
         st.trough_roi = min(roi, 0.0)
         if st.stage != "UNPROTECTED" and roi < cfg.breakeven_trigger_roi:
@@ -220,6 +224,23 @@ def evaluate(
                 f"现价 {_px(pos.mark_price)}，强平价 {_px(pos.liquidation_price)}",
                 "止损可能来不及：考虑立即减仓/平仓或追加保证金")
             _note(st, "R09", now, dist)
+
+    # ---- R14 交易所账户：仓位没挂止损单（或止损单只覆盖了一部分）。开仓 / 加仓后留 2 分钟给你挂单；
+    # 每个仓位版本只提醒一次（加仓后数量变了、没跟着改止损单，会再提醒）。多空对冲合并仓不判断
+    if pos.stop_cover is not None and not pos.is_hedge and pos.stop_cover < 0.99 \
+            and now - (st.version_ts or st.first_seen) >= 120:
+        f = st.fired.get("R14")
+        if not f or f.get("version") != st.version:
+            if pos.stop_cover <= 0:
+                title, sug = "仓位没挂止损单", "在交易所给这个仓位挂一张止损单（只减仓 / 全部平仓）"
+            else:
+                title = f"止损单只覆盖了 {pos.stop_cover * 100:.0f}% 的仓位"
+                sug = "加仓后数量变了：把止损单改成全部平仓，或补挂剩余数量的止损单"
+            tier = cfg.tier_rois(pos.leverage)[0]
+            ref = pos.price_at_roi(-tier)
+            add("R14", "warn", title, f"数量 {pos.qty:g}，开仓 {_px(pos.entry_price)}，现价 {_px(pos.mark_price)}",
+                sug + (f"；参考：第 1 档亏损（-{tier * 100:.0f}%）对应价格约 {_px(ref)}" if ref else ""))
+            st.fired["R14"] = {"version": st.version, "ts": now}
 
     # ---- R04 浮盈达门槛 → 建议保本
     if pos.is_hedge:
@@ -322,6 +343,8 @@ class AccountSnapshot:
     native_stop_u: float  # totalStopLossUsdt：原生总止损额（0 = 未设置）
     native_stop_trigger_equity: float  # totalStopLossAmount：权益跌到该值时触发（推断）
     disposal: str  # SELL_ALL / SELF_MANAGING ...
+    kind: str = "copy"  # copy 跟单关系 / exchange 交易所账户（没有原生总止损和暂停，有维持保证金率）
+    margin_ratio: float | None = None  # 维持保证金率（交易所账户）
 
     @classmethod
     def from_relation(cls, r: dict) -> "AccountSnapshot":
@@ -389,6 +412,8 @@ def evaluate_account(
 
     # 复用 PosState 的去重工具
     shim = PosState(key=key, version=st.version, fired=st.fired)
+    copy = a.kind == "copy"
+    word = "跟单权益" if copy else "账户权益"
 
     dd = (st.peak_equity - a.equity) / st.peak_equity if st.peak_equity > 0 else 0.0
     loss_u = a.equity - a.invested
@@ -402,11 +427,14 @@ def evaluate_account(
         upgrade = severe and today is not None and prev_sev != "urgent"
         if upgrade or _daily(shim, "A01", now, lambda prev: dd >= prev + cfg.account_dd_step):
             add("A01b" if severe else "A01", "urgent" if severe else "warn",
-                f"跟单权益从最高点回撤 {dd * 100:.1f}%（{a.equity - st.peak_equity:+.2f}U）", detail,
-                "考虑在币安暂停该跟单（不再开新仓）或减仓；若未设置跟单总止损，现在设置")
+                f"{word}从最高点回撤 {dd * 100:.1f}%（{a.equity - st.peak_equity:+.2f}U）", detail,
+                "考虑在币安暂停该跟单（不再开新仓）或减仓；若未设置跟单总止损，现在设置" if copy
+                else "考虑减仓、给亏损仓位挂止损单，暂停开新仓")
             _note(shim, "A01", now, dd, sev="urgent" if severe else "warn")
 
-    if not a.has_native_stop:
+    if not copy:
+        pass  # 交易所账户没有“跟单总止损”（A02 / A03）
+    elif not a.has_native_stop:
         rec = recommended_stop_u or round(a.invested * cfg.recommend_total_stop_pct, 2)
         if a.invested > 0 and _can_fire(shim, "A02", now, 24 * 3600):
             add("A02", "info", "该跟单未设置“总止损”",
@@ -431,13 +459,28 @@ def evaluate_account(
         f = shim.fired.get("A05")
         done = f.get("level", 0) if f and f.get("version") == shim.version else 0
         if int(m) > done:
-            add("A05", "warn", f"利润翻倍：跟单权益 {a.equity:.2f}U，已是本金 {a.invested:.2f}U 的 {m:.1f} 倍",
+            where = "在币安该跟单的“调整资金 / 赎回”里" if copy else "从合约账户划转到资金账户，"
+            add("A05", "warn", f"利润翻倍：{word} {a.equity:.2f}U，已是本金 {a.invested:.2f}U 的 {m:.1f} 倍",
                 f"{detail}",
-                f"在币安该跟单的“调整资金 / 赎回”里取出约 {a.invested:.0f}U 本金，让 {a.equity - a.invested:.0f}U 利润继续跑；"
+                f"{where}取出约 {a.invested:.0f}U 本金，让 {a.equity - a.invested:.0f}U 利润继续跑；"
                 "有持仓时可取余额可能不够，可以分批取，或等仓位少的时候再取")
             shim.fired["A05"] = {"version": shim.version, "ts": now, "level": int(m)}
 
-    if a.is_paused and _can_fire(shim, "A04", now, 24 * 3600):
+    # ---- A06 交易所账户维持保证金率（全仓时比单仓强平价更准的爆仓风险）：当天只提醒一次；
+    # 再升高 10 个点、或从提醒线进入紧急线，立即再提醒
+    r = a.margin_ratio
+    if not copy and r is not None and r >= cfg.margin_ratio_warn:
+        severe = r >= cfg.margin_ratio_severe
+        today = _fired_today(shim, "A06", now)
+        upgrade = severe and today is not None and today.get("sev") != "urgent"
+        if upgrade or _daily(shim, "A06", now, lambda prev: r >= prev + 0.10):
+            add("A06b" if severe else "A06", "urgent" if severe else "warn",
+                f"账户维持保证金率 {r * 100:.0f}%（100% 会被强平）",
+                f"{detail}；维持保证金率 = 维持保证金 ÷ 账户权益，越高越危险",
+                "立即减仓或追加保证金；亏损仓位尽快挂止损单" if severe else "考虑减仓或追加保证金，给仓位挂好止损单")
+            _note(shim, "A06", now, r, sev="urgent" if severe else "warn")
+
+    if copy and a.is_paused and _can_fire(shim, "A04", now, 24 * 3600):
         add("A04", "info", "该跟单处于暂停状态（不会跟新仓，已有仓位仍在）")
         _mark(shim, "A04", now)
 

@@ -1,7 +1,9 @@
 """统计：盈亏日历、区间汇总、盈亏构成、亏损分析、领航员排行、利润回吐。
 
 口径（页面上同样注明）：
-- 已实现净盈亏 = 已实现盈亏 + 手续费（手续费为负数），来自我的逐笔成交，含跟单开始以来的历史回补；
+- 已实现净盈亏 = 已实现盈亏 + 手续费（手续费为负数）+ 资金费：跟单来自我的逐笔成交（含跟单开始以来的历史回补，
+  没有资金费数据）；交易所账户来自资金流水（account_ledger，近 3 个月回补，含资金费）；
+- source 筛选：all 全部 / copy 只看跟单 / 交易所账户 ID（x 开头）只看这个账户；
 - 权益变化 =（权益 − 净投入）的变化，扣除追加 / 赎回，来自 5 分钟一次的权益快照（安装后才有）；
 - 分润 = 跟单关系里的累计已分润，按区间首尾做差；资金费接口没有数据，不含。
 日期按服务器时区（systemd 里设置的 TZ，默认 Asia/Shanghai）划分。
@@ -15,6 +17,7 @@ import time
 
 from . import exits
 from .lifecycle import episodes, labels
+from .models import is_mine
 
 
 def _local_midnight(ts: float) -> float:
@@ -31,26 +34,66 @@ def period_starts(now: float) -> dict[str, float]:
             "d30": today - 29 * 86400, "all": 0.0}
 
 
-def daily_realized(store, start: float, end: float, lead_id: str | None = None) -> dict[str, dict]:
-    """按天汇总我的已实现盈亏和手续费：{'2026-11-03': {realized, fee, net, trades}}。"""
-    sql = ("SELECT date(ts_ms/1000, 'unixepoch', 'localtime') AS d, SUM(realized), SUM(fee), "
-           "SUM(CASE WHEN realized <> 0 THEN 1 ELSE 0 END) FROM fills WHERE ts_ms >= ? AND ts_ms < ?")
-    args: list = [int(start * 1000), int(end * 1000)]
-    if lead_id:
-        sql += " AND lead_id=?"
-        args.append(lead_id)
-    sql += " GROUP BY d"
-    return {d: {"realized": r or 0.0, "fee": f or 0.0, "net": (r or 0.0) + (f or 0.0), "trades": n or 0}
-            for d, r, f, n in store.db.execute(sql, args)}
+def is_account(source: str | None) -> bool:
+    return bool(source) and source[0] == "x"
 
 
-def daily_equity_change(store, start: float, end: float) -> dict[str, float]:
-    """按天的（权益 − 净投入）变化，所有跟单合计：每天最后一个点减前一天最后一个点。
+def daily_realized(store, start: float, end: float, lead_id: str | None = None,
+                   source: str = "all") -> dict[str, dict]:
+    """按天汇总我的已实现盈亏、手续费、资金费：{'2026-11-03': {realized, fee, funding, net, trades}}。
+    lead_id：某个领航员（跟单）或交易所账户；source：all / copy / 账户 ID。"""
+    rng = [int(start * 1000), int(end * 1000)]
+    out: dict[str, dict] = {}
+
+    def add(d, r, f, fu, n):
+        x = out.setdefault(d, {"realized": 0.0, "fee": 0.0, "funding": 0.0, "net": 0.0, "trades": 0})
+        x["realized"] += r or 0.0
+        x["fee"] += f or 0.0
+        x["funding"] += fu or 0.0
+        x["trades"] += n or 0
+        x["net"] = x["realized"] + x["fee"] + x["funding"]
+
+    target = lead_id or (source if is_account(source) else None)
+    if not is_account(target) and source in ("all", "copy"):
+        sql = ("SELECT date(ts_ms/1000, 'unixepoch', 'localtime') AS d, SUM(realized), SUM(fee), "
+               "SUM(CASE WHEN realized <> 0 THEN 1 ELSE 0 END) FROM fills WHERE ts_ms >= ? AND ts_ms < ?")
+        args = list(rng)
+        if target:
+            sql += " AND lead_id=?"
+            args.append(target)
+        for d, r, f, n in store.db.execute(sql + " GROUP BY d", args):
+            add(d, r, f, 0.0, n)
+    if source != "copy" and (target is None or is_account(target)):
+        sql = ("SELECT date(ts_ms/1000, 'unixepoch', 'localtime') AS d, "
+               "SUM(CASE WHEN kind='realized' THEN amount ELSE 0 END), SUM(CASE WHEN kind='fee' THEN amount ELSE 0 END), "
+               "SUM(CASE WHEN kind='funding' THEN amount ELSE 0 END), "
+               "SUM(CASE WHEN kind='realized' AND amount <> 0 THEN 1 ELSE 0 END) "
+               "FROM account_ledger WHERE ts_ms >= ? AND ts_ms < ?")
+        args = list(rng)
+        if target:
+            sql += " AND account_id=?"
+            args.append(target)
+        for d, r, f, fu, n in store.db.execute(sql + " GROUP BY d", args):
+            add(d, r, f, fu, n)
+    return out
+
+
+def _equity_filter(source: str) -> tuple[str, list]:
+    if source == "copy":
+        return " AND leader_id NOT LIKE 'x%'", []
+    if is_account(source):
+        return " AND leader_id = ?", [source]
+    return "", []
+
+
+def daily_equity_change(store, start: float, end: float, source: str = "all") -> dict[str, float]:
+    """按天的（权益 − 净投入）变化（跟单和交易所账户合计，可按来源筛选）：每天最后一个点减前一天最后一个点。
     一次顺序扫描，避免相关子查询在快照变多后变慢。"""
     last: dict[str, dict[str, float]] = {}
+    where, extra = _equity_filter(source)
     for ts, lid, v in store.db.execute(
-            "SELECT ts, leader_id, equity - invested FROM equity WHERE ts >= ? AND ts < ? ORDER BY ts",
-            (start - 86400, end)):
+            "SELECT ts, leader_id, equity - invested FROM equity WHERE ts >= ? AND ts < ?" + where + " ORDER BY ts",
+            (start - 86400, end, *extra)):
         last.setdefault(time.strftime("%Y-%m-%d", time.localtime(ts)), {})[lid] = v
     out, prev = {}, None
     for d in sorted(last):
@@ -61,12 +104,12 @@ def daily_equity_change(store, start: float, end: float) -> dict[str, float]:
     return {d: v for d, v in out.items() if d >= first_day}
 
 
-def calendar_month(store, year: int, month: int) -> dict:
+def calendar_month(store, year: int, month: int, source: str = "all") -> dict:
     start = time.mktime((year, month, 1, 0, 0, 0, 0, 0, -1))
     days_in = _cal.monthrange(year, month)[1]
     end = start + days_in * 86400 + 3600  # 跨夏令时也覆盖到月底
-    realized = daily_realized(store, start, end)
-    eq = daily_equity_change(store, start, end)
+    realized = daily_realized(store, start, end, source=source)
+    eq = daily_equity_change(store, start, end, source)
     days = []
     for d in range(1, days_in + 1):
         key = f"{year:04d}-{month:02d}-{d:02d}"
@@ -94,47 +137,72 @@ def _profit_shared_change(store, start: float) -> float:
     return total
 
 
-def periods(store, now: float | None = None) -> dict:
+def periods(store, now: float | None = None, source: str = "all") -> dict:
     now = now or time.time()
     out = {}
     starts = period_starts(now)
     for name, start in starts.items():
         end = starts["today"] if name == "yesterday" else now + 1
-        d = daily_realized(store, start, end)
-        out[name] = {"net": sum(x["net"] for x in d.values()), "realized": sum(x["realized"] for x in d.values()),
-                     "fee": sum(x["fee"] for x in d.values()), "trades": sum(x["trades"] for x in d.values())}
+        d = daily_realized(store, start, end, source=source)
+        out[name] = {k: sum(x[k] for x in d.values()) for k in ("net", "realized", "fee", "funding", "trades")}
     return out
 
 
-def composition(store, now: float | None = None) -> dict:
+def _source_match(p: dict, source: str) -> bool:
+    if source == "copy":
+        return p.get("source") == "copy"
+    if is_account(source):
+        return p.get("leader_id") == source
+    return is_mine(p.get("source") or "")
+
+
+def composition(store, now: float | None = None, source: str = "all") -> dict:
     now = now or time.time()
     month = period_starts(now)["month"]
-    d_all = daily_realized(store, 0, now + 1)
-    d_month = daily_realized(store, month, now + 1)
+    d_all = daily_realized(store, 0, now + 1, source=source)
+    d_month = daily_realized(store, month, now + 1, source=source)
     positions, _ = store.get_runtime("positions", [])
-    unreal = sum(p.get("unrealized_pnl") or 0 for p in positions or [] if p.get("source") == "copy")
-    return {
-        "all": {"realized": sum(x["realized"] for x in d_all.values()), "fee": sum(x["fee"] for x in d_all.values()),
-                "profit_shared": -_profit_shared_change(store, 0.0)},
-        "month": {"realized": sum(x["realized"] for x in d_month.values()),
-                  "fee": sum(x["fee"] for x in d_month.values()),
-                  "profit_shared": -_profit_shared_change(store, month)},
-        "unrealized": unreal,
-    }
+    unreal = sum(p.get("unrealized_pnl") or 0 for p in positions or [] if _source_match(p, source))
+    shared = not is_account(source)  # 分润只有跟单有
+
+    def part(d, since):
+        return {"realized": sum(x["realized"] for x in d.values()), "fee": sum(x["fee"] for x in d.values()),
+                "funding": sum(x["funding"] for x in d.values()),
+                "profit_shared": -_profit_shared_change(store, since) if shared else 0.0}
+    return {"all": part(d_all, 0.0), "month": part(d_month, month), "unrealized": unreal}
 
 
-def losses(store, limit: int = 10) -> dict:
-    rows = store.db.execute(
-        "SELECT m.lead_id, COALESCE(l.name, m.lead_id), m.symbol, m.side, m.opened_ms, m.closed_ms, m.pnl, m.roi, m.leverage "
-        "FROM my_positions m LEFT JOIN leaders l ON l.lead_id=m.lead_id WHERE m.status='All Closed' ORDER BY m.pnl LIMIT ?",
-        (limit,)).fetchall()
-    worst = [{"lead_id": r[0], "leader_name": r[1], "symbol": r[2], "side": r[3], "opened_ms": r[4], "closed_ms": r[5],
-              "pnl": r[6], "roi": r[7], "leverage": r[8]} for r in rows if (r[6] or 0) < 0]
+def _closed_trades(store, source: str) -> list[dict]:
+    """已平仓的单笔结果：跟单用币安的历史仓位（精确的平仓盈亏）；交易所账户用仓位回合（平仓前最后的浮动盈亏，近似）。"""
+    out = []
+    if not is_account(source):
+        for r in store.db.execute(
+                "SELECT m.lead_id, COALESCE(l.name, m.lead_id), m.symbol, m.side, m.opened_ms, m.closed_ms, m.pnl, m.roi, "
+                "m.leverage FROM my_positions m LEFT JOIN leaders l ON l.lead_id=m.lead_id WHERE m.status='All Closed'"):
+            out.append({"lead_id": r[0], "leader_name": r[1], "symbol": r[2], "side": r[3], "opened_ms": r[4],
+                        "closed_ms": r[5], "pnl": r[6] or 0.0, "roi": r[7], "leverage": r[8]})
+    if source != "copy":
+        sql = ("SELECT leader_id, leader_name, symbol, side, opened_ts, closed_ts, last_u, last_roi, leverage FROM episodes "
+               "WHERE source='exchange' AND status='closed' AND last_u IS NOT NULL")
+        args = []
+        if is_account(source):
+            sql += " AND leader_id=?"
+            args.append(source)
+        for r in store.db.execute(sql, args):
+            out.append({"lead_id": r[0], "leader_name": r[1], "symbol": r[2], "side": r[3],
+                        "opened_ms": int((r[4] or 0) * 1000), "closed_ms": int((r[5] or 0) * 1000), "pnl": r[6],
+                        "roi": r[7], "leverage": r[8], "approx": True})
+    return out
+
+
+def losses(store, limit: int = 10, source: str = "all") -> dict:
+    trades = _closed_trades(store, source)
+    worst = sorted((t for t in trades if t["pnl"] < 0), key=lambda t: t["pnl"])[:limit]
     buckets = [(-1e18, -50), (-50, -20), (-20, -10), (-10, -5), (-5, -1), (-1, 0), (0, 1), (1, 5), (5, 20), (20, 1e18)]
     names = ["≤-50", "-50~-20", "-20~-10", "-10~-5", "-5~-1", "-1~0", "0~1", "1~5", "5~20", "≥20"]
-    pnls = [r[0] for r in store.db.execute("SELECT pnl FROM my_positions WHERE status='All Closed'")]
+    pnls = [t["pnl"] for t in trades]
     dist = [{"range": n, "count": sum(1 for p in pnls if lo <= (p or 0) < hi)} for n, (lo, hi) in zip(names, buckets)]
-    days = daily_realized(store, 0, time.time() + 1)
+    days = daily_realized(store, 0, time.time() + 1, source=source)
     streak = best = 0
     prev = None
     for d in sorted(days):

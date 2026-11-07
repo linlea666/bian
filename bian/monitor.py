@@ -8,8 +8,9 @@ from .api import copy_account, leaders as leaders_api
 from .client import AuthExpired, BinanceError, Client, RateLimited
 from .config import AppConfig, LeaderConfig
 from .exposure import describe_legs, net_by_symbol
-from .models import Position
+from .models import SOURCE_LABELS, Position, is_mine
 from .notify import Notifier, Outgoing, deliver_all, is_soft
+from .exchanges import EXCHANGES, classify_stops
 from .sync import mark_copy_set
 from .rules import (
     AccountSnapshot, AccountState, Alert, PortfolioState, PosState, RuleConfig, principal_multiple,
@@ -42,6 +43,12 @@ class LeaderRuntime:
     positions: dict[str, Position] = field(default_factory=dict)  # 原始单腿仓位
     blocked_reason: str = ""
     initialized: bool = False  # 首次成功拉取前的已有持仓合并成一条汇总，避免启动刷屏
+    # ---- 交易所账户（source="exchange"）
+    adapter: object = None
+    account: dict | None = None  # exchange_accounts 表里的一行
+    stops: list = field(default_factory=list)
+    stops_ts: float = 0.0
+    last_error: str = ""
 
 
 class Monitor:
@@ -51,10 +58,16 @@ class Monitor:
     ABSENT_CONFIRM_S = 120  # 且至少持续 2 分钟
     EMPTY_CONFIRM_S = 600  # 整个列表突然变空：至少持续 10 分钟
 
+    STOPS_EVERY_S = 60  # 交易所账户的止损单每分钟查一次（不是每轮），节省请求
+
     def __init__(self, cfg: AppConfig, client: Client, notifier: Notifier, store: Store, clock=time.time,
-                 guard=None, recorder=None, rules_provider=None):
+                 guard=None, recorder=None, rules_provider=None, exchange_provider=None):
         """guard：CredentialGuard（凭证失效时暂停私有接口）；recorder：EpisodeRecorder（仓位回合）；
-        rules_provider(leader_id) -> RuleConfig：网页配置的阈值（支持按领航员覆盖，热更新）。"""
+        rules_provider(leader_id) -> RuleConfig：网页配置的阈值（支持按领航员覆盖，热更新）；
+        exchange_provider() -> [(账户行, 适配器工厂)]：启用中的交易所账户（每轮同步，增删改即时生效）。"""
+        self.exchange_provider = exchange_provider
+        self.copy_accounts_view: list[dict] = []
+        self.exchange_view: dict[str, dict] = {}
         self.cfg, self.client, self.notifier, self.store, self.clock = cfg, client, notifier, store, clock
         self.guard, self.recorder = guard, recorder
         self.rules_provider = rules_provider or (lambda pid: cfg.rules.merged(
@@ -100,6 +113,8 @@ class Monitor:
                     c = LeaderConfig(portfolio_id=pid, name=str(rel.get("nickname") or ""), source="copy")
                     self.leaders.append(LeaderRuntime(c, self.rules_provider(pid)))
         for lr in self.leaders:
+            if lr.source == "exchange":
+                continue  # 交易所账户由 _sync_exchange_accounts 管理，和跟单关系无关（凭证恢复后重跑 setup 也不能改它的数据源）
             pid = lr.cfg.portfolio_id
             try:
                 d = leaders_api.detail(self.client, pid)
@@ -127,6 +142,8 @@ class Monitor:
 
     # -------------------------------------------------------------- poll
     def fetch(self, lr: LeaderRuntime) -> list[Position]:
+        if lr.source == "exchange":
+            return self._fetch_exchange(lr)
         if lr.source == "copy":
             return copy_account.copy_positions(self.client, lr.copy_portfolio_id or "", lr.cfg.portfolio_id)
         return leaders_api.public_positions(self.client, lr.cfg.portfolio_id)
@@ -136,6 +153,7 @@ class Monitor:
         now = self.clock()
         t0 = time.monotonic()
         errors: list[str] = []
+        self._sync_exchange_accounts(now)
         for lr in self.leaders:
             if lr.blocked_reason:
                 continue
@@ -150,10 +168,14 @@ class Monitor:
             except (RateLimited, BinanceError) as e:
                 print(f"[{lr.name}] 拉取持仓失败：{e}")
                 errors.append(f"{lr.name}: {e}")
+                lr.last_error = str(e)
                 sent += self._check_stale(lr, now)
                 continue
+            lr.last_error = ""
             sent += self._process(lr, positions, now)
         sent += self._accounts(now)
+        sent += self._exchange_accounts(now)
+        self.store.set_runtime("accounts", self.copy_accounts_view + list(self.exchange_view.values()))
         sent += self._portfolio(now)
         self.flush(now)
         self._publish_runtime(now, time.monotonic() - t0, errors)
@@ -226,8 +248,108 @@ class Monitor:
                 "profit_shared": r.get("profitSharedAmount"), "positions": len(lr.positions),
                 "principal_multiple": principal_multiple(snap, lr.rules),  # 利润翻倍待办用（按领航员设置）
             })
-        self.store.set_runtime("accounts", accounts_view)
+        self.copy_accounts_view = accounts_view  # 和交易所账户合并后由 poll_once 写入 runtime
         return out
+
+    # ------------------------------------------------------------ 交易所账户（API Key 只读）
+    def _sync_exchange_accounts(self, now: float) -> None:
+        """按账户表同步监控对象：新启用的加入、停用 / 移除的退出（未平回合以“停止监控”收尾）、换了密钥的重建适配器。"""
+        if not self.exchange_provider:
+            return
+        try:
+            wanted = {a["id"]: (a, make) for a, make in self.exchange_provider()}
+        except Exception as e:  # noqa: BLE001  读账户表失败不能影响跟单监控
+            print(f"读取交易所账户失败：{type(e).__name__}: {e}")
+            return
+        for lr in [x for x in self.leaders if x.source == "exchange"]:
+            pid = lr.cfg.portfolio_id
+            if pid not in wanted:
+                self.leaders.remove(lr)
+                self.exchange_view.pop(pid, None)
+                if self.recorder:
+                    self.recorder.close_leader(pid, lr.name, now, reason="停止监控")
+                self.store.log_event("account.stopped", f"[{lr.name}] 已停止监控这个交易所账户", leader_id=pid, ts=now)
+        known = {lr.cfg.portfolio_id: lr for lr in self.leaders if lr.source == "exchange"}
+        for pid, (a, make) in wanted.items():
+            name = f"{EXCHANGES.get(a['exchange'], a['exchange'])} · {a['name']}"
+            lr = known.get(pid)
+            if lr is None:
+                lr = LeaderRuntime(LeaderConfig(portfolio_id=pid, name=name, source="exchange"),
+                                   self.rules_provider(pid), source="exchange", name=name)
+                self.leaders.append(lr)
+                self.store.log_event("account.monitoring", f"[{name}] 开始监控这个交易所账户", leader_id=pid, ts=now)
+            if lr.adapter is None or (lr.account or {}).get("key_hint") != a.get("key_hint"):
+                lr.adapter = make()  # 首次或更新了密钥
+                lr.stops_ts = 0.0
+            lr.account, lr.name = a, name
+
+    def _fetch_exchange(self, lr: LeaderRuntime) -> list[Position]:
+        positions = lr.adapter.positions()
+        if not (lr.account or {}).get("stop_check", 1):
+            return positions  # 这个账户关闭了止损单检查：stop_price 保持 None，不提醒
+        now = self.clock()
+        if now - lr.stops_ts >= self.STOPS_EVERY_S:
+            try:
+                lr.stops, lr.stops_ts = lr.adapter.stop_orders(), now
+            except BinanceError as e:  # 查挂单失败：本轮不判断“没挂止损”，避免误报
+                print(f"[{lr.name}] 读取止损单失败：{e}")
+                return positions
+        covered = classify_stops(positions, lr.stops)
+        for p in positions:
+            p.stop_price, p.stop_cover = covered.get(p.key, (0.0, 0.0))
+        return positions
+
+    def _exchange_accounts(self, now: float) -> list[Alert]:
+        """交易所账户级规则（权益回撤、利润翻倍取回本金、维持保证金率）。每个账户每轮一个账户接口请求。"""
+        out: list[Alert] = []
+        for lr in [x for x in self.leaders if x.source == "exchange"]:
+            pid, a = lr.cfg.portfolio_id, lr.account or {}
+            try:
+                info = lr.adapter.account()
+            except BinanceError as e:
+                # 只在已有完整快照时标记错误（作战室要用权益等字段）；第一次就失败的，错误写进账户表，设置页能看到
+                if pid in self.exchange_view:
+                    self.exchange_view[pid]["error"] = str(e)
+                self.store.db.execute("UPDATE exchange_accounts SET last_error=? WHERE id=?", (str(e), pid))
+                continue
+            invested = self._exchange_invested(pid, a, info.equity, now)
+            snap = AccountSnapshot(lead_id=pid, nickname=lr.name, equity=info.equity, invested=invested,
+                                   unrealized=info.unrealized, realized=0.0, is_paused=False, native_stop_u=0.0,
+                                   native_stop_trigger_equity=0.0, disposal="", kind="exchange",
+                                   margin_ratio=info.margin_ratio)
+            key = f"acct:{pid}"
+            st, alerts = evaluate_account(snap, self.accounts.get(key), lr.rules, now)
+            self.accounts[key] = st
+            self.store.save_state(key, st.to_dict())
+            out += [self._send(x, lr) for x in alerts]
+            if now - self.last_equity_ts.get(pid, 0) >= self.EQUITY_EVERY_S:
+                self.last_equity_ts[pid] = now
+                self.store.add_equity(now, pid, snap.equity, snap.invested, snap.unrealized, 0.0)
+            unprotected = sum(1 for p in lr.positions.values() if p.stop_cover is not None and p.stop_cover < 0.99)
+            self.exchange_view[pid] = {
+                **asdict(snap), "name": lr.name, "kind": "exchange", "exchange": a.get("exchange"),
+                "available": info.available, "maint_margin": info.maint_margin, "peak_equity": st.peak_equity,
+                "drawdown": (st.peak_equity - snap.equity) / st.peak_equity if st.peak_equity > 0 else 0.0,
+                "positions": len(lr.positions), "unprotected": unprotected, "error": lr.last_error or None,
+                "stop_check": bool(a.get("stop_check", 1)), "last_ok": lr.last_ok,
+                "principal_multiple": principal_multiple(snap, lr.rules),
+            }
+            self.store.db.execute("UPDATE exchange_accounts SET last_ok=?, last_error=? WHERE id=?",
+                                  (now, lr.last_error or None, pid))
+        self.store.db.commit()
+        return out
+
+    def _exchange_invested(self, pid: str, a: dict, equity: float, now: float) -> float:
+        """交易所账户的“净投入”= 开始监控时的权益 + 之后的净划转（转入为正）。
+        这样转入转出不会被当成盈利或回撤（划转来自后台同步的资金流水）。"""
+        if a.get("baseline_equity") is None:
+            self.store.db.execute("UPDATE exchange_accounts SET baseline_equity=?, baseline_ts=? WHERE id=?",
+                                  (equity, now, pid))
+            a["baseline_equity"], a["baseline_ts"] = equity, now
+        moved = self.store.db.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM account_ledger WHERE account_id=? AND kind='transfer' AND ts_ms>?",
+            (pid, int(a["baseline_ts"] * 1000))).fetchone()[0]
+        return a["baseline_equity"] + moved
 
     def _sync_relations(self, rels: list[dict], now: float) -> None:
         """运行中发现新跟单 / 结束跟单：自动加入或移除监控（只针对自动发现的领航员）；
@@ -353,7 +475,7 @@ class Monitor:
             if not lr.initialized and not known:
                 # 启动时已存在的仓位：info 级提醒并入汇总，warn/urgent 仍单独发
                 line = f"{pos.symbol} {self._side_cn(pos)} {pos.leverage:g}x ROI {pos.roi * 100:+.1f}%"
-                if pos.source == "copy":
+                if is_mine(pos.source):
                     line += f"（{pos.unrealized_pnl:+.2f}U）"
                 if any(a.rule_id == "R04" for a in alerts):
                     be = pos.break_even_price if pos.break_even_price > 0 else pos.entry_price
@@ -367,7 +489,7 @@ class Monitor:
             if summary:
                 out.append(self._send(Alert(
                     "R00", "info", f"leader:{lr.cfg.portfolio_id}", 0,
-                    f"开始监控，当前 {len(summary)} 个持仓（来源：{'我的跟单仓位' if lr.source == 'copy' else '领航员公开持仓'}）",
+                    f"开始监控，当前 {len(summary)} 个持仓（来源：{SOURCE_LABELS.get(lr.source, lr.source)}）",
                     "\n".join(summary), ts=now), lr))
         for key in [k for k in self.states if k.startswith(prefix) and k not in current]:
             st = self.states.pop(key)
@@ -388,7 +510,8 @@ class Monitor:
             return [self._send(Alert(
                 "R08", "warn", f"leader:{lr.cfg.portfolio_id}", 0,
                 f"[{lr.name}] 数据已 {int(now - lr.last_ok)} 秒未更新",
-                "持仓/行情不是实时的，期间的风险判断不可靠", "请直接打开币安 App 查看仓位", ts=now))]
+                "持仓/行情不是实时的，期间的风险判断不可靠" + (f"。原因：{lr.last_error}" if lr.last_error else ""),
+                "请直接打开交易所 App 查看仓位", ts=now))]
         return []
 
     def _portfolio(self, now: float) -> list[Alert]:
@@ -397,7 +520,7 @@ class Monitor:
         est = 0.0
         for lr in self.leaders:
             for p in net_by_symbol(list(lr.positions.values())):
-                if p.source == "copy":
+                if is_mine(p.source):
                     est += p.unrealized_pnl
                 elif lr.cfg.position_margin_u > 0:
                     est += p.roi * lr.cfg.position_margin_u
@@ -420,7 +543,7 @@ class Monitor:
     @staticmethod
     def _margin_u(lr: LeaderRuntime, pos: Position) -> float | None:
         """我在该仓位上的保证金（U），用于换算盈亏金额。"""
-        if pos.source == "copy":
+        if is_mine(pos.source):
             return pos.margin or None
         return lr.cfg.position_margin_u or None
 
@@ -444,7 +567,7 @@ class Monitor:
         lines = []
         head = a.title
         if lr and pos:
-            src = "我的跟单仓位" if pos.source == "copy" else "领航员仓位"
+            src = SOURCE_LABELS.get(pos.source, "领航员仓位")
             head = f"[{lr.name}] {pos.symbol} {self._side_cn(pos)} {pos.leverage:g}x ｜{a.title}"
             lines.append(head)
             if pos.is_hedge:
@@ -452,7 +575,7 @@ class Monitor:
                 lines.append("两条腿：" + describe_legs(list(lr.positions.values()), pos.symbol))
             else:
                 lines.append(f"{src}：开仓 {pos.entry_price:.6g} 现价 {pos.mark_price:.6g} ROI {pos.roi * 100:+.1f}%")
-            if pos.source == "copy":
+            if is_mine(pos.source):
                 lines.append(f"浮动盈亏 {pos.unrealized_pnl:+.2f}U")
             elif lr.cfg.position_margin_u > 0:
                 lines.append(f"按每笔 {lr.cfg.position_margin_u:g}U 估算我的盈亏 {pos.roi * lr.cfg.position_margin_u:+.2f}U")

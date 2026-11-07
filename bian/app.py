@@ -10,6 +10,7 @@ from .config import AppConfig
 from .credentials import CredentialGuard
 from .lifecycle import EpisodeRecorder
 from .monitor import Monitor
+from . import accounts
 from .notify import HELD, EmailNotifier, MultiNotifier, Outgoing, StdoutNotifier, describe_smtp_error, smtp_send
 from .rules import Alert
 from .settings import Settings
@@ -127,7 +128,9 @@ class App:
         cfg = self.apply_settings(force=True) or self.settings.get()
         self.monitor = Monitor(self.cfg, self.client, self.notifier(cfg), store, self.clock, guard=self.guard,
                                recorder=EpisodeRecorder(store, self.clock),
-                               rules_provider=lambda pid: self.settings.rules_config(pid))
+                               rules_provider=lambda pid: self.settings.rules_config(pid),
+                               exchange_provider=lambda: [(a, lambda a=a: accounts.adapter(self.settings, a))
+                                                          for a in accounts.active(store)])
         store.log_event("service.start", "风控服务已启动")
         if self.restore_held(store):
             print("已恢复重启前等待发送的邮件提醒", flush=True)
@@ -246,6 +249,15 @@ class App:
                     if jobs.needs_refresh(store, lid):
                         jobs.enqueue(store, lid, "有新的历史仓位")
 
+        def ledger_sync() -> None:
+            """交易所账户的资金流水（已实现盈亏、手续费、资金费、划转）：每 30 分钟增量一次，每个账户单独隔离。"""
+            now = self.clock()
+            for a in accounts.active(store):
+                if now - (a.get("ledger_synced") or 0) < self.COPY_SYNC_S:
+                    continue
+                guarded(f"同步账户流水 {a['name']}", lambda a=a: sync.sync_account_ledger(
+                    store, accounts.adapter(self.settings, a), a["id"], now))
+
         def judge() -> None:
             now = self.clock()
             poll = self.cfg.poll_seconds
@@ -275,6 +287,7 @@ class App:
         while not self._stop.is_set():
             guarded("同步我的跟单", copy_sync)
             guarded("同步领航员历史", leader_sync)
+            guarded("同步交易所账户流水", ledger_sync)
             guarded("离场判定", judge)
             guarded("跟单偏差", daily_deviation)
             guarded("每日维护", lambda: self.maintenance(store))

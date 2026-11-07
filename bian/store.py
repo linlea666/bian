@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS episode_points (
   episode_id INTEGER, ts REAL, roi REAL, u REAL, mark REAL
 );
 CREATE INDEX IF NOT EXISTS idx_points ON episode_points(episode_id, ts);
+-- ===== 交易所账户（API Key 只读；密钥在 secrets.json，不进数据库）=====
+CREATE TABLE IF NOT EXISTS exchange_accounts (
+  id TEXT PRIMARY KEY, exchange TEXT, name TEXT, enabled INTEGER DEFAULT 1, removed INTEGER DEFAULT 0,
+  stop_check INTEGER DEFAULT 1, created REAL, last_ok REAL, last_error TEXT, perm TEXT,
+  baseline_equity REAL, baseline_ts REAL, ledger_synced REAL, key_hint TEXT
+);
+-- 交易所账户的资金流水：已实现盈亏 / 手续费 / 资金费 / 划转（统计和“净投入”用）
+CREATE TABLE IF NOT EXISTS account_ledger (
+  uid TEXT PRIMARY KEY, account_id TEXT, ts_ms INTEGER, kind TEXT, symbol TEXT, amount REAL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger ON account_ledger(account_id, ts_ms);
 """
 
 MIGRATIONS = [

@@ -40,9 +40,14 @@ def run_doctor(client: Client, config_path: str | None = None, test_email: bool 
         item(FAIL, "行情 www.binance.com/fapi", str(e))
     try:
         urllib.request.urlopen("https://fapi.binance.com/fapi/v1/time", timeout=10).read()
-        item(OK, "fapi.binance.com（仅供参考，本工具不依赖）", "可访问")
+        item(OK, "fapi.binance.com（接入币安交易所账户时需要）", "可访问")
     except Exception as e:  # noqa: BLE001
-        item(WARN, "fapi.binance.com（仅供参考，本工具不依赖）", f"不可访问：{getattr(e, 'code', type(e).__name__)}")
+        item(WARN, "fapi.binance.com（接入币安交易所账户时需要）", f"不可访问：{getattr(e, 'code', type(e).__name__)}")
+    try:
+        urllib.request.urlopen("https://www.okx.com/api/v5/public/time", timeout=10).read()
+        item(OK, "www.okx.com（接入 OKX 账户时需要）", "可访问")
+    except Exception as e:  # noqa: BLE001
+        item(WARN, "www.okx.com（接入 OKX 账户时需要）", f"不可访问：{getattr(e, 'code', type(e).__name__)}")
 
     settings = None
     if config_path and os.path.exists(config_path):
@@ -72,6 +77,19 @@ def run_doctor(client: Client, config_path: str | None = None, test_email: bool 
             item(FAIL, "币安登录凭证", str(e))
     else:
         item(WARN, "币安登录凭证", "未设置：登录后台 → 设置 → 币安凭证（或首次引导）粘贴 cURL")
+
+    if settings:  # 交易所账户：逐个测试连接（只读：权限、权益、持仓、止损单）
+        from . import accounts
+        from .store import Store
+
+        for a in accounts.active(Store(settings.db_path)):
+            name = f"交易所账户 {accounts.label(a)}"
+            try:
+                r = accounts.test_connection(a["exchange"], settings.exchange_keys(a["id"]), a["id"])
+                item(OK, name, f"只读 key 正常{'（已绑定 IP）' if r['permissions']['ip_restricted'] else '（建议绑定服务器 IP）'}；"
+                     f"权益 {r['equity']:.2f}U，持仓 {r['positions']} 个，止损单 {r['stops']} 张")
+            except (BinanceError, accounts.AccountError) as e:
+                item(FAIL, name, str(e))
 
     from .notify import SmtpConfig, describe_smtp_error, smtp_send
 

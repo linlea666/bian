@@ -56,6 +56,7 @@ DEFAULTS: dict = {
     "notify": {
         "email_enabled": True,
         "email_events": list(DEFAULT_EVENTS),  # 哪些事件发邮件（其余只在后台记录，并进每日摘要）
+        "email_events_seen": list(EVENT_KEYS),  # 保存设置时已有的事件：之后新增的默认开启事件升级时自动加进来
         "email_batch_minutes": 60,  # 非紧急提醒攒多久汇总一封；0 = 立即发。紧急的始终立即发
         "email_max_per_hour": 6,
         "leader_actions": {},  # 领航员 ID -> 是否发开仓 / 加仓 / 减仓 / 平仓邮件；没设置的跟随全局
@@ -105,6 +106,17 @@ def mask(secret: str | None) -> str:
     return f"{head}****{secret[-3:]}"
 
 
+def is_target_id(v) -> bool:
+    """单独设置的对象：领航员（数字 ID）或交易所账户（x 开头的 6 位十六进制）。"""
+    v = str(v)
+    return v.isdigit() or (len(v) == 7 and v[0] == "x" and all(c in "0123456789abcdef" for c in v[1:]))
+
+
+# 开始记录 email_events_seen 之前就有的事件（“利润翻倍取回本金”及之后新增的不在其中）
+LEGACY_EVENT_KEYS = ("loss_tier", "account_dd", "liquidation", "profit_to_loss", "native_stop", "portfolio", "residual",
+                     "add_in_loss", "system", "trail", "add", "tp_ladder", "breakeven", "info")
+
+
 def upgrade(raw: dict) -> dict:
     """旧版保存的配置升级到当前格式（读取时执行，下次保存时落盘）：
     - 按级别发邮件（email_min_severity）→ 按事件勾选（email_events）；当时默认的每小时 12 封降为 6 封；
@@ -116,6 +128,13 @@ def upgrade(raw: dict) -> dict:
             n["email_max_per_hour"] = 6
     if isinstance(n, dict):
         n.pop("email_min_severity", None)
+        # 新版本新增、默认要发邮件的事件：用户之前没见过（不是主动取消的），自动加进勾选列表
+        seen = n.get("email_events_seen")
+        seen = set(seen) if isinstance(seen, list) else set(LEGACY_EVENT_KEYS)
+        if isinstance(n.get("email_events"), list):
+            n["email_events"] = list(n["email_events"]) + [k for k in DEFAULT_EVENTS
+                                                            if k not in seen and k not in n["email_events"]]
+        n["email_events_seen"] = list(EVENT_KEYS)
     if isinstance(raw.get("rules"), dict):
         raw["rules"] = {k: v for k, v in raw["rules"].items() if k in RULE_KEYS}
     if isinstance(raw.get("leader_rules"), dict):
@@ -158,7 +177,7 @@ def validate(cfg: dict) -> dict:
         raise SettingsError("发邮件的事件不合法")
     n["email_events"] = [k for k in EVENT_KEYS if k in events]  # 去重、固定顺序
     la = n.get("leader_actions")
-    if not isinstance(la, dict) or any(not str(k).isdigit() or not isinstance(v, bool) for k, v in la.items()):
+    if not isinstance(la, dict) or any(not is_target_id(k) or not isinstance(v, bool) for k, v in la.items()):
         raise SettingsError("按领航员的交易动作邮件设置不合法")
     n["email_batch_minutes"] = int(float(n["email_batch_minutes"]))
     if not 0 <= n["email_batch_minutes"] <= 240:
@@ -260,18 +279,37 @@ class Settings:
                     data.pop(k, None)
                 else:
                     data[k] = v
-            d = os.path.dirname(os.path.abspath(self.secrets_path))
-            os.makedirs(d, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=d, prefix=".secrets-")
-            try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False)
-                os.replace(tmp, self.secrets_path)
-            except BaseException:
-                if os.path.exists(tmp):
-                    os.unlink(tmp)
-                raise
+            self._write_secrets(data)
+
+    def set_exchange_keys(self, account_id: str, keys: dict | None) -> None:
+        """交易所账户的 API 密钥（存在 secrets.json 的 exchange_keys 下）；None 表示删除。整个读改写在锁内完成。"""
+        with self._lock:
+            data = self.secrets()
+            ex = dict(data.get("exchange_keys") or {})
+            if keys is None:
+                ex.pop(account_id, None)
+            else:
+                ex[account_id] = dict(keys)
+            data["exchange_keys"] = ex
+            self._write_secrets(data)
+
+    def exchange_keys(self, account_id: str) -> dict:
+        return dict((self.secrets().get("exchange_keys") or {}).get(account_id) or {})
+
+    def _write_secrets(self, data: dict) -> None:
+        """原子写入 secrets.json（权限 600）。调用方持有 self._lock。"""
+        d = os.path.dirname(os.path.abspath(self.secrets_path))
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".secrets-")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self.secrets_path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
 
     def binance_credentials(self) -> tuple[str, str]:
         s = self.secrets()

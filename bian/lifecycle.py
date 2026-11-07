@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 
-from .models import Position
+from .models import Position, is_mine
 
 COLS = ("id", "pos_key", "leader_id", "leader_name", "symbol", "side", "source", "status", "opened_ts",
         "closed_ts", "first_entry", "last_entry", "first_qty", "max_qty", "last_qty", "leverage", "max_margin_u",
@@ -90,7 +90,7 @@ class EpisodeRecorder:
         self.store.db.commit()
 
     def _money(self, p: Position, roi: float) -> float | None:
-        return roi * p.margin if p.source == "copy" and p.margin else None
+        return roi * p.margin if is_mine(p.source) and p.margin else None
 
     def _open(self, leader_id: str, leader_name: str, p: Position, now: float) -> None:
         roi = p.roi
@@ -101,7 +101,7 @@ class EpisodeRecorder:
             "last_qty": p.qty, "leverage": p.leverage, "max_margin_u": p.margin,
             "mae_roi": min(roi, 0.0), "mae_u": self._money(p, min(roi, 0.0)), "mae_ts": now,
             "mfe_roi": max(roi, 0.0), "mfe_u": self._money(p, max(roi, 0.0)), "mfe_ts": now,
-            "last_roi": roi, "last_u": p.unrealized_pnl if p.source == "copy" else None, "last_mark": p.mark_price,
+            "last_roi": roi, "last_u": p.unrealized_pnl if is_mine(p.source) else None, "last_mark": p.mark_price,
             "adds": 0, "reduces": 0, "reduces_in_profit": 0, "max_tier": 0, "alerts": 0,
             "exit_type": None, "note": None, "last_seen": now,
         }
@@ -141,7 +141,7 @@ class EpisodeRecorder:
             ep["mfe_roi"], ep["mfe_u"], ep["mfe_ts"] = roi, self._money(p, roi), now
         ep.update(last_entry=p.entry_price, last_qty=p.qty, max_qty=max(ep["max_qty"] or 0, p.qty),
                   leverage=p.leverage or ep["leverage"], max_margin_u=max(ep["max_margin_u"] or 0, p.margin),
-                  last_roi=roi, last_u=p.unrealized_pnl if p.source == "copy" else None, last_mark=p.mark_price,
+                  last_roi=roi, last_u=p.unrealized_pnl if is_mine(p.source) else None, last_mark=p.mark_price,
                   last_seen=now, leader_name=leader_name)
         self._save(ep)
         self._point(ep, p, now)
@@ -175,7 +175,7 @@ class EpisodeRecorder:
             return
         self.last_point[ep["id"]] = now
         self.store.db.execute("INSERT INTO episode_points (episode_id, ts, roi, u, mark) VALUES (?,?,?,?,?)",
-                              (ep["id"], now, p.roi, p.unrealized_pnl if p.source == "copy" else None, p.mark_price))
+                              (ep["id"], now, p.roi, p.unrealized_pnl if is_mine(p.source) else None, p.mark_price))
 
     def _record_exit(self, ep: dict, now: float, qty: float, partial: bool, mark, roi, exit_type: str,
                      created: float | None = None) -> None:
@@ -189,11 +189,11 @@ class EpisodeRecorder:
             (ep["id"], ep["leader_id"], ep["leader_name"], ep["symbol"], ep["side"], now, qty, ep.get("last_entry"),
              mark, int(partial), roi, exit_type, "", "pending", created or now, ep.get("opened_ts")))
 
-    def close_leader(self, leader_id: str, leader_name: str, now: float | None = None) -> None:
-        """跟单关系结束：该跟单下仍未结束的回合以“跟单结束”收尾。"""
+    def close_leader(self, leader_id: str, leader_name: str, now: float | None = None, reason: str = "跟单结束") -> None:
+        """跟单关系结束（或交易所账户停止监控，reason="停止监控"）：仍未结束的回合以 reason 收尾。"""
         now = now or self.clock()
         for key in [k for k, e in self.open.items() if e["leader_id"] == leader_id]:
-            self._close(self.open[key], now, "跟单结束", leader_name)
+            self._close(self.open[key], now, reason, leader_name)
         self.store.db.commit()
 
     # ------------------------------------------------------------ 提醒关联

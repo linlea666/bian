@@ -19,7 +19,9 @@ from .. import __version__
 from ..csvutil import to_csv
 from ..curl_parse import CurlParseError, parse_credentials
 from .. import exits as exits_mod, jobs as jobs_mod, leader_data, recommend as recommend_mod, stats as stats_mod
+from .. import accounts as accounts_mod
 from ..api import leaders as leaders_api
+from ..exchanges import EXCHANGES
 from ..client import BinanceError, Client
 from ..lifecycle import episodes, get_episode
 from ..sync import ensure_leader
@@ -308,12 +310,18 @@ def make_handler(app):
                 raise ValueError
         except ValueError:
             raise ApiError(400, "月份格式应为 YYYY-MM") from None
+        src = str(q.get("source") or "all")
+        if src not in ("all", "copy") and not accounts_mod.ID_RE.match(src):
+            raise ApiError(400, "来源参数不正确")
         synced = app.store.db.execute("SELECT COUNT(*), MIN(ts_ms) FROM fills").fetchone()
         return {
-            "calendar": stats_mod.calendar_month(app.store, y, m),
-            "periods": stats_mod.periods(app.store, now),
-            "composition": stats_mod.composition(app.store, now),
-            "losses": stats_mod.losses(app.store),
+            "source": src,
+            "sources": [{"id": "all", "name": "全部"}, {"id": "copy", "name": "跟单"}] + [
+                {"id": a["id"], "name": accounts_mod.label(a)} for a in accounts_mod.list_accounts(app.store)],
+            "calendar": stats_mod.calendar_month(app.store, y, m, src),
+            "periods": stats_mod.periods(app.store, now, src),
+            "composition": stats_mod.composition(app.store, now, src),
+            "losses": stats_mod.losses(app.store, source=src),
             "exits": exits_mod.summary(app.store, 0),
             "exits_month": exits_mod.summary(app.store, stats_mod.period_starts(now)["month"]),
             "giveback": stats_mod.giveback(app.store),
@@ -422,6 +430,81 @@ def make_handler(app):
         return {"ok": True, "backup": os.path.basename(path), "deleted": counts,
                 "message": f"已删除，删除前的数据已备份到服务器 data/backups/{os.path.basename(path)}"}
 
+    # ---------------------------------------------------------------- 交易所账户
+    def accounts_list(h, q, b, s):
+        live = app.store.get_runtime("accounts", [])[0] or []
+        return {"accounts": accounts_mod.list_accounts(app.store), "exchanges": EXCHANGES,
+                "runtime": {a["lead_id"]: a for a in live if a.get("kind") == "exchange"}}
+
+    def _account_id(d) -> str:
+        aid = str(d.get("id") or "")
+        if not accounts_mod.ID_RE.match(aid):
+            raise ApiError(400, "账户 ID 不正确")
+        return aid
+
+    def _account_call(fn):
+        try:
+            return fn()
+        except accounts_mod.AccountError as e:
+            raise ApiError(400, str(e)) from None
+        except BinanceError as e:  # ExchangeError 是它的子类：错误说明里已经带了处理建议
+            raise ApiError(400, f"连接失败：{e}") from None
+
+    def account_test(h, q, b, s):
+        """测试连接：新 key（exchange + 密钥）或已保存的账户（id）。不保存任何东西。"""
+        if b.get("id"):
+            a = accounts_mod.get(app.store, _account_id(b))
+            if not a:
+                raise ApiError(404, "没有这个账户")
+            out = _account_call(lambda: accounts_mod.test_connection(
+                a["exchange"], app.settings.exchange_keys(a["id"]), a["id"]))
+        else:
+            ex = str(b.get("exchange") or "")
+            out = _account_call(lambda: accounts_mod.test_connection(ex, accounts_mod.clean_keys(ex, b)))
+        return {"ok": True, **out, "overlap": _copy_overlap(out["symbols"])}
+
+    def _copy_overlap(symbols: list[str]) -> list[str]:
+        """和跟单仓位同币种同方向的：可能是跟单仓位出现在交易所账户里（OKX 跟单可能这样），提示用户核对。"""
+        positions, _ = app.store.get_runtime("positions", [])
+        copy = {f"{p['symbol']}:{p['side']}" for p in positions or [] if p.get("source") == "copy"}
+        return sorted(set(symbols) & copy)
+
+    def account_add(h, q, b, s):
+        ex = str(b.get("exchange") or "")
+        out = _account_call(lambda: accounts_mod.add(app.store, app.settings, ex, str(b.get("name") or ""), b))
+        app.wake()
+        return {"ok": True, **out, "overlap": _copy_overlap(out["symbols"]),
+                "message": "已添加，下一轮监控开始读取这个账户"}
+
+    def account_update(h, q, b, s):
+        aid = _account_id(b)
+        keys = b if any(b.get(k) for k in ("api_key", "secret", "passphrase")) else None
+        a = _account_call(lambda: accounts_mod.update(
+            app.store, app.settings, aid, name=b.get("name"),
+            enabled=b.get("enabled") if "enabled" in b else None,
+            stop_check=b.get("stop_check") if "stop_check" in b else None, raw_keys=keys))
+        app.wake()
+        return {"ok": True, "account": a}
+
+    def account_remove(h, q, b, s):
+        aid = _account_id(b)
+        out = _account_call(lambda: accounts_mod.remove(app.store, app.settings, aid, bool(b.get("delete_data")),
+                                                        os.path.join(app.data_dir, "backups"), str(b.get("confirm") or "")))
+        app.wake()
+        if out.get("backup"):
+            out["backup"] = os.path.basename(out["backup"])
+        return {"ok": True, **out}
+
+    def account_export(h, q, b, s):
+        aid = _account_id(q)
+        if not accounts_mod.get(app.store, aid):
+            raise ApiError(404, "没有这个账户")
+        body = leader_data.export_zip(app.store, app.settings, aid)
+        h._send(200, body, "application/zip", {
+            "Cache-Control": "no-store",
+            "Content-Disposition": f'attachment; filename="bian-account-{aid}-{time.strftime("%Y%m%d-%H%M%S")}.zip"'})
+        return None
+
     def episode_detail(h, q, b, s):
         try:
             eid = int(q.get("id") or 0)
@@ -436,7 +519,7 @@ def make_handler(app):
         lp = exits_mod.leader_match(app.store, ep["leader_id"], ep["symbol"], ep["side"], ep["opened_ts"])
         return {"episode": ep, "points": [{"ts": p[0], "roi": p[1], "u": p[2], "mark": p[3]} for p in pts],
                 "events": app.store.events(limit=300, episode_id=eid), "exits": exs,
-                "leader_position": lp.__dict__ if lp else None, "link": views.LEAD_URL.format(ep["leader_id"])}
+                "leader_position": lp.__dict__ if lp else None, "link": views.target_link(ep["leader_id"], (accounts_mod.get(app.store, ep["leader_id"]) or {}).get("exchange"))}
 
     def exits_list(h, q, b, s):
         return {"exits": exits_mod.exits_list(app.store, int(q.get("limit") or 200), q.get("leader") or None)}
@@ -502,6 +585,12 @@ def make_handler(app):
         ("GET", "/api/leaders/export"): (leader_export, True),
         ("POST", "/api/leaders/adopt"): (leader_adopt, True),
         ("GET", "/api/discover"): (discover, True),
+        ("GET", "/api/accounts"): (accounts_list, True),
+        ("POST", "/api/accounts/test"): (account_test, True),
+        ("POST", "/api/accounts"): (account_add, True),
+        ("POST", "/api/accounts/update"): (account_update, True),
+        ("POST", "/api/accounts/remove"): (account_remove, True),
+        ("GET", "/api/accounts/export"): (account_export, True),
         ("POST", "/api/leaders/delete"): (leader_delete, True),
     }
     Handler.status = HTTPStatus

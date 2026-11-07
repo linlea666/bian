@@ -36,6 +36,8 @@ EVENT_GROUPS: list[tuple[str, str, tuple[str, ...], bool]] = [
     ("add_in_loss", "亏损中还在加仓（摊平扛单）", ("R07L",), True),
     ("system", "无法监控 / 数据中断", ("R08",), True),
     ("principal_out", "利润翻倍，建议取回本金", ("A05",), True),
+    ("margin_ratio", "交易所账户保证金率过高", ("A06", "A06b"), True),
+    ("no_stop", "交易所仓位没挂止损单", ("R14",), True),
     ("trail", "浮盈回撤", ("R05",), False),
     ("add", "领航员加仓", ("R07",), False),
     ("tp_ladder", "分批止盈到位", ("R13",), False),
@@ -44,7 +46,7 @@ EVENT_GROUPS: list[tuple[str, str, tuple[str, ...], bool]] = [
 ]
 EVENT_KEYS = [g[0] for g in EVENT_GROUPS]
 DEFAULT_EVENTS = [g[0] for g in EVENT_GROUPS if g[3]]
-URGENT_EVENTS = ["loss_tier", "account_dd", "liquidation", "profit_to_loss", "native_stop", "portfolio"]
+URGENT_EVENTS = ["loss_tier", "account_dd", "liquidation", "profit_to_loss", "native_stop", "portfolio", "margin_ratio"]
 ALWAYS_EMAIL = ("AUTH",)  # 凭证失效：始终发，不可关闭
 ACTION_RULES = ("R00", "R07", "R07b", "R11")  # 交易动作：开仓 / 加仓 / 减仓 / 平仓（可按领航员单独开关）
 

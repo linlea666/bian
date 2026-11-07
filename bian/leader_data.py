@@ -29,6 +29,9 @@ TABLES: list[tuple[str, str, int]] = [
     ("leader_history", "lead_id=?", 1),
     ("leader_profiles", "lead_id=?", 1),
     ("jobs", "lead_id=?", 1),
+    # 交易所账户（ID 是 x 开头，和数字的领航员 ID 不会冲突）
+    ("account_ledger", "account_id=?", 1),
+    ("exchange_accounts", "id=?", 1),
 ]
 
 
@@ -72,15 +75,20 @@ class DeleteRefused(ValueError):
     pass
 
 
-def delete(store, settings, lid: str, backup_dir: str) -> tuple[str, dict]:
-    """删除前先导出到 backup_dir（权限 600），再在一个事务里删掉该领航员的全部数据。返回 (备份路径, 各表删除条数)。"""
+def delete(store, settings, lid: str, backup_dir: str, name: str | None = None,
+           require_leader: bool = True) -> tuple[str, dict]:
+    """删除前先导出到 backup_dir（权限 600），再在一个事务里删掉该领航员（或交易所账户）的全部数据。
+    返回 (备份路径, 各表删除条数)。交易所账户由 accounts.remove 调用（require_leader=False）。"""
     row = leader_row(store, lid)
-    if not row:
-        raise DeleteRefused("没有这个领航员的数据")
-    if row["kind"] == "copy":
-        raise DeleteRefused("正在跟单的领航员不能删除（下次同步会重新生成）。请先在币安停止跟单")
+    if require_leader:
+        if not row:
+            raise DeleteRefused("没有这个领航员的数据")
+        if row["kind"] == "copy":
+            raise DeleteRefused("正在跟单的领航员不能删除（下次同步会重新生成）。请先在币安停止跟单")
+    name = name or (row and row["name"]) or lid
     os.makedirs(backup_dir, exist_ok=True)
-    path = os.path.join(backup_dir, f"leader-{lid}-{time.strftime('%Y%m%d-%H%M%S')}.zip")
+    prefix = "leader" if require_leader else "account"
+    path = os.path.join(backup_dir, f"{prefix}-{lid}-{time.strftime('%Y%m%d-%H%M%S')}.zip")
     data = export_zip(store, settings, lid)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as f:
@@ -94,6 +102,7 @@ def delete(store, settings, lid: str, backup_dir: str) -> tuple[str, dict]:
     rules = dict(settings.get()["leader_rules"])
     if rules.pop(lid, None) is not None:
         settings.update({"leader_rules": rules})
-    store.log_event("leader.deleted", f"已删除领航员 {row['name'] or lid} 的全部数据（删除前已备份到 {os.path.basename(path)}）",
+    store.log_event("leader.deleted", f"已删除{'领航员' if require_leader else '交易所账户'} {name} 的全部数据"
+                    f"（删除前已备份到 {os.path.basename(path)}）",
                     deleted=counts)  # 这条事件不带 leader_id，不会被一起删
     return path, counts

@@ -4,9 +4,19 @@ from __future__ import annotations
 import time
 
 from ..lifecycle import episodes
+from ..models import is_mine
 from ..notify import SOFT_MARKERS
 
 LEAD_URL = "https://www.binance.com/zh-CN/copy-trading/lead-details/{}"
+EXCHANGE_URLS = {"binance": "https://www.binance.com/zh-CN/my/orders/futures/openorder",
+                 "okx": "https://www.okx.com/zh-hans/trade-swap"}
+
+
+def target_link(leader_id: str, exchange: str | None = None) -> str:
+    """跟单 → 领航员主页；交易所账户（x 开头）→ 交易所的合约页面。"""
+    if leader_id.startswith("x"):
+        return EXCHANGE_URLS.get(exchange or "", EXCHANGE_URLS["binance"])
+    return LEAD_URL.format(leader_id)
 COPY_MGMT_URL = "https://www.binance.com/zh-CN/copy-trading"
 
 
@@ -40,6 +50,13 @@ def pnl_since(store, start: float, accounts: list[dict]) -> float | None:
 def light_for_account(a: dict, rules: dict, positions: list[dict]) -> str:
     mine = [p for p in positions if p["leader_id"] == a["lead_id"]]
     tier = max((p.get("tier") or 0 for p in mine), default=0)
+    if a.get("kind") == "exchange":  # 交易所账户：没有跟单总止损，看保证金率和止损单
+        mr = a.get("margin_ratio") or 0
+        if a["drawdown"] >= rules["account_dd_severe"] or tier >= 2 or mr >= rules["margin_ratio_severe"] or a.get("error"):
+            return "red"
+        if a["drawdown"] >= rules["account_dd_warn"] or tier >= 1 or mr >= rules["margin_ratio_warn"] or a.get("unprotected"):
+            return "yellow"
+        return "green"
     if a["drawdown"] >= rules["account_dd_severe"] or tier >= 2:
         return "red"
     if a["drawdown"] >= rules["account_dd_warn"] or tier >= 1 or not a.get("native_stop_u"):
@@ -73,11 +90,13 @@ def build_todos(ctx: dict) -> list[dict]:
     for p in ctx["positions"]:
         if p.get("tier", 0) >= 1:
             side = {"LONG": "多", "SHORT": "空", "HEDGE": "多空对冲"}.get(p["side"], p["side"])
-            u = f"{p['unrealized_pnl']:+.2f}U" if p.get("source") == "copy" else ""
+            u = f"{p['unrealized_pnl']:+.2f}U" if is_mine(p.get("source") or "") else ""
+            ex = p.get("source") == "exchange"
             add(f"pos:{p['key']}:tier{p['tier']}", "red" if p["tier"] >= 2 else "yellow",
                 f"{p['leader_name']} · {p['symbol']} {side} 亏损到第 {p['tier']} 档",
-                f"当前 ROI {p['roi'] * 100:+.1f}% {u}。去币安给这个跟单仓位设置止损或手动减仓。",
-                "去币安", LEAD_URL.format(p["leader_id"]))
+                f"当前 ROI {p['roi'] * 100:+.1f}% {u}。" + ("去交易所给这个仓位挂止损单或手动减仓。" if ex
+                                                          else "去币安给这个跟单仓位设置止损或手动减仓。"),
+                "去交易所" if ex else "去币安", p.get("link") or target_link(p["leader_id"]))
     rules = settings["rules"]
     for a in ctx["accounts"]:
         if a["drawdown"] >= rules["account_dd_warn"]:
@@ -89,6 +108,19 @@ def build_todos(ctx: dict) -> list[dict]:
             add(f"acct:principal:{a['lead_id']}:{a['invested']:.0f}", "yellow", f"把 {a['name']} 的本金取出来",
                 f"权益 {a['equity']:.2f}U，已是本金 {a['invested']:.2f}U 的 {a['principal_multiple']:.1f} 倍。取出本金后，剩下的利润继续跑，不再亏本。",
                 "去币安", COPY_MGMT_URL)
+        if a.get("kind") == "exchange":
+            mr = a.get("margin_ratio") or 0
+            if mr >= rules["margin_ratio_warn"]:
+                lvl = "red" if mr >= rules["margin_ratio_severe"] else "yellow"
+                add(f"acct:mr:{a['lead_id']}:{lvl}", lvl, f"{a['name']} 维持保证金率 {mr * 100:.0f}%",
+                    "100% 会被强平。减仓或追加保证金，给仓位挂好止损单。", "去交易所", a.get("link"))
+            if a.get("unprotected"):
+                add(f"acct:nostop:{a['lead_id']}:{a['unprotected']}", "yellow",
+                    f"{a['name']} 有 {a['unprotected']} 个仓位没挂好止损单", "去持仓页看是哪几个，在交易所补挂止损单。",
+                    "看持仓", "#/positions")
+            if a.get("error"):
+                add(f"acct:error:{a['lead_id']}", "red", f"{a['name']} 读取失败", a["error"], "去设置", "#/settings/exchanges")
+            continue
         if not a.get("native_stop_u"):
             add(f"acct:nostop:{a['lead_id']}", "yellow", f"给 {a['name']} 设置跟单总止损",
                 f"净投入 {a['invested']:.0f}U，建议总止损约 {a['recommended_stop_u']:.0f}U。这是币安原生功能，由交易所自动执行。",
@@ -121,6 +153,9 @@ def overview(store, settings, now: float | None = None) -> dict:
     accounts = accounts or []
     positions, _ = store.get_runtime("positions", [])
     positions = positions or []
+    exmap = dict(store.db.execute("SELECT id, exchange FROM exchange_accounts").fetchall())
+    for p in positions:
+        p["link"] = target_link(p["leader_id"], exmap.get(p["leader_id"]))
     smtp_ok = settings.smtp_config(cfg) is not None and cfg["notify"]["email_enabled"]
     # 只把真正的发送错误算作失败：按设置不发、等待合并、达到每小时上限稍后补发等，都不是故障
     last_mail_fail = store.db.execute(
@@ -129,12 +164,12 @@ def overview(store, settings, now: float | None = None) -> dict:
         (now - 3600, *[f"%{m}%" for m in SOFT_MARKERS])).fetchone()
     rules = cfg["rules"]
     for a in accounts:
+        a["link"] = target_link(a["lead_id"], a.get("exchange"))
         a["light"] = light_for_account(a, rules, positions)
-        a["link"] = LEAD_URL.format(a["lead_id"])
         a["pnl"] = a["equity"] - a["invested"]
     today = pnl_since(store, day_start(now), accounts)
     month = pnl_since(store, month_start(now), accounts)
-    worst = min((p for p in positions if p.get("source") == "copy"), key=lambda p: p["unrealized_pnl"], default=None)
+    worst = min((p for p in positions if is_mine(p.get("source") or "")), key=lambda p: p["unrealized_pnl"], default=None)
     alerts_today = store.count_alerts_since(day_start(now))
     ctx = {"cred": cred, "poll": poll, "settings": cfg, "positions": positions, "accounts": accounts,
            "smtp_ok": smtp_ok, "done": store.todos_done()}
@@ -146,7 +181,10 @@ def overview(store, settings, now: float | None = None) -> dict:
         "totals": {
             "equity": sum(a["equity"] for a in accounts),
             "invested": sum(a["invested"] for a in accounts),
-            "unrealized": sum(p["unrealized_pnl"] for p in positions if p.get("source") == "copy"),
+            # 跟单 / 交易所账户小计（作战室显示“其中”）
+            "copy_equity": sum(a["equity"] for a in accounts if a.get("kind", "copy") == "copy"),
+            "exchange_equity": sum(a["equity"] for a in accounts if a.get("kind") == "exchange"),
+            "unrealized": sum(p["unrealized_pnl"] for p in positions if is_mine(p.get("source") or "")),
             "today_pnl": today, "month_pnl": month,
             "positions": len(positions),
             "worst_position": worst and {k: worst[k] for k in ("leader_name", "symbol", "side", "unrealized_pnl", "roi")},
@@ -161,12 +199,13 @@ def overview(store, settings, now: float | None = None) -> dict:
 
 def positions_view(store) -> dict:
     positions, upd = store.get_runtime("positions", [])
+    exchanges = dict(store.db.execute("SELECT id, exchange FROM exchange_accounts").fetchall())
     open_eps = {e["pos_key"]: e for e in episodes(store, status="open", limit=500)}
     for p in positions or []:
         keys = [p["key"]] if p["side"] != "HEDGE" else [f"{p['leader_id']}:{p['symbol']}:LONG", f"{p['leader_id']}:{p['symbol']}:SHORT"]
         eps = [open_eps[k] for k in keys if k in open_eps]
         p["episodes"] = [{k: e[k] for k in ("id", "opened_ts", "mae_roi", "mae_u", "mfe_roi", "mfe_u", "adds", "reduces", "max_tier")} for e in eps]
-        p["link"] = LEAD_URL.format(p["leader_id"])
+        p["link"] = target_link(p["leader_id"], exchanges.get(p["leader_id"]))
     return {"updated": upd, "positions": positions or []}
 
 

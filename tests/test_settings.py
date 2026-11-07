@@ -135,3 +135,20 @@ def test_leader_actions_setting(tmp_path):
     for bad in ({"abc": True}, {"111": "yes"}):
         with pytest.raises(SettingsError):
             st.update({"notify": {"leader_actions": bad}})
+
+
+def test_new_default_events_added_for_existing_users_but_unchecked_kept(tmp_path):
+    """已保存过邮件设置的用户：之后新增的默认开启事件自动加入；用户主动取消的不会被加回来。"""
+    import json
+    import sqlite3
+
+    st = Settings(str(tmp_path / "a.db"), str(tmp_path / "s.json"))
+    old = {"notify": {"email_events": ["loss_tier", "liquidation"]}}  # 旧版：没有 email_events_seen
+    with sqlite3.connect(tmp_path / "a.db") as db:
+        db.execute("INSERT INTO settings VALUES ('app', ?, 1)", (json.dumps(old),))
+    ev = st.get()["notify"]["email_events"]
+    assert {"principal_out", "margin_ratio", "no_stop"} <= set(ev)  # 新事件自动开启
+    assert "account_dd" not in ev  # 旧事件里用户没勾的保持不勾
+    cfg = st.save(st.get())
+    cfg, _ = st.update({"notify": {"email_events": ["loss_tier"]}})  # 用户主动取消新事件
+    assert st.get()["notify"]["email_events"] == ["loss_tier"]

@@ -5,6 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+SOURCE_LABELS = {"copy": "我的跟单仓位", "exchange": "交易所账户持仓", "public": "领航员仓位"}
+
+
+def is_mine(source: str) -> bool:
+    """是不是我自己的钱：我的跟单仓位、交易所账户持仓（领航员公开持仓不是）。
+    用于金额换算、金额门槛、回合里的 U 值等；和“是不是跟单关系”（source == "copy"）区分开。"""
+    return source in ("copy", "exchange")
+
+
 def fnum(v, default: float = 0.0) -> float:
     try:
         return float(v)
@@ -24,11 +33,15 @@ class Position:
     mark_price: float
     leverage: float
     unrealized_pnl: float
-    source: str  # "public" 领航员公开持仓 / "copy" 我的跟单仓位
+    source: str  # "public" 领航员公开持仓 / "copy" 我的跟单仓位 / "exchange" 交易所账户持仓
     break_even_price: float = 0.0
     liquidation_price: float = 0.0
     initial_margin: float = 0.0  # 接口有就用，否则按开仓价反推
     update_time: int = 0  # 毫秒；接口没给则为 0
+    # 交易所账户：止损单情况（None = 不检查 / 不适用）。stop_price 为离现价最近的止损触发价，0 = 没挂；
+    # stop_cover = 止损单覆盖的数量比例（1 = 全部）
+    stop_price: float | None = None
+    stop_cover: float | None = None
 
     @property
     def key(self) -> str:
