@@ -237,7 +237,7 @@ class EmailNotifier(Notifier):
     """事件过滤 + 合并发送 + 每小时上限 + 失败重试。
 
     events：发邮件的事件分组（None 表示按 min_severity 级别过滤，命令行旧配置用）。
-    batch_minutes：非紧急提醒攒多久汇总一封（0 = 每轮立即发）；有紧急提醒时立即发，并捎上等待中的。"""
+    batch_minutes：非紧急提醒攒多久汇总一封（0 = 每轮立即发）；有紧急提醒、或单独设为“发邮件”的领航员有交易动作时立即发，并捎上等待中的。"""
 
     name = "email"
 
@@ -263,6 +263,10 @@ class EmailNotifier(Notifier):
         if self.events is not None:
             return event_group(it.rule_id) in self.events
         return LEVEL.get(it.severity, 0) >= self.min_level
+
+    def immediate(self, it: Outgoing) -> bool:
+        """不等汇总、立即发：紧急提醒；或单独设为“发邮件”的领航员 / 账户的交易动作（开仓 / 加仓 / 减仓 / 平仓）。"""
+        return it.severity == "urgent" or (it.rule_id in ACTION_RULES and self.leader_actions.get(it.leader_id) is True)
 
     def requeue(self, items: list[Outgoing]) -> None:
         """服务重启后，把还在等待合并的提醒放回队列（由调用方从 alerts 表恢复）。"""
@@ -293,9 +297,9 @@ class EmailNotifier(Notifier):
             return results
         if now < self.retry_at:
             return results + [(it, False, "email: 上次发送失败，等待重试") for it in items if it in self.pending]
-        urgent = any(p.severity == "urgent" for p in self.pending)
+        now_ = any(self.immediate(p) for p in self.pending)  # 立即发时顺带捎上等待中的提醒
         oldest = min(p.created for p in self.pending)
-        if not urgent and self.batch_s > 0 and now - oldest < self.batch_s:
+        if not now_ and self.batch_s > 0 and now - oldest < self.batch_s:
             at = time.strftime("%H:%M", time.localtime(oldest + self.batch_s))
             return results + [(it, False, f"email: {HELD}，约 {at} 汇总发送") for it in items if it in self.pending]
         self.sent_times = [t for t in self.sent_times if now - t < 3600]

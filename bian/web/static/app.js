@@ -709,7 +709,7 @@ function leaderActionsBox(n) {
   if (!ids.length) return "";
   const val = (id) => (la[id] === true ? "on" : la[id] === false ? "off" : "");
   return `<fieldset><legend>按领航员单独设置交易动作邮件</legend>
-    <div class="hint">开仓 / 加仓 / 减仓 / 平仓这四种提醒：单独设置的领航员以这里为准，其余跟随上面的全局勾选。亏损档位、强平等风险提醒不受影响。</div>
+    <div class="hint">开仓 / 加仓 / 减仓 / 平仓这四种提醒：单独设置的领航员以这里为准，其余跟随上面的全局勾选。设为“发邮件”的会立即发（不等汇总间隔，仍受每小时上限保护）。亏损档位、强平等风险提醒不受影响。</div>
     <div class="ev-grid">${ids.map((id) => `<label class="f"><span>${esc(names[id] || id)}</span><select data-la="${esc(id)}">
       <option value="" ${val(id) === "" ? "selected" : ""}>跟随全局</option><option value="on" ${val(id) === "on" ? "selected" : ""}>发邮件</option>
       <option value="off" ${val(id) === "off" ? "selected" : ""}>不发</option></select></label>`).join("")}</div></fieldset>`;

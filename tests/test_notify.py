@@ -235,3 +235,29 @@ def test_leader_action_switch_overrides_global():
     sent = {it.row_id for it, ok, _ in em2.deliver([Outgoing(7, "g", "info", 0, "R07b", "222"),
                                                    Outgoing(8, "h", "info", 0, "R07b", "333")], now=10) if ok}
     assert sent == {8}  # 全局都发，单独关闭的领航员不发
+
+
+def test_leader_action_on_sends_immediately_despite_batching():
+    """单独设为“发邮件”的领航员：交易动作不等汇总间隔，立即发并捎上等待中的提醒；仍受每小时上限。"""
+    rec = Recorder()
+    em = EmailNotifier(CFG, events=notify.EVENT_KEYS, sender=rec, batch_minutes=60, max_per_hour=2,
+                       leader_actions={"111": True, "222": False})
+    t0 = 1_000_000.0
+    # 跟随全局的开仓、普通提醒：照常进入 60 分钟汇总
+    res = em.deliver([Outgoing(1, "跟随全局开仓", "info", t0, "R00", "333"),
+                      Outgoing(2, "浮盈回撤", "warn", t0, "R05", "111")], now=t0)
+    assert not rec.mails and all(notify.HELD in r for _, ok, r in res if not ok)
+    # 单独设为不发：直接跳过
+    res = em.deliver([Outgoing(3, "不发", "info", t0 + 60, "R00", "222")], now=t0 + 60)
+    assert not rec.mails and res[0][2] == "email: " + notify.SKIPPED
+    # 单独设为发邮件的开仓：当轮立即发，顺带捎上 1、2
+    res = em.deliver([Outgoing(4, "单独开启开仓", "info", t0 + 120, "R00", "111")], now=t0 + 120)
+    assert len(rec.mails) == 1 and {it.row_id for it, ok, _ in res if ok} == {1, 2, 4}
+    # 非交易动作（即使是这个领航员的）不触发立即发
+    em.deliver([Outgoing(5, "建议保本", "warn", t0 + 180, "R04", "111")], now=t0 + 180)
+    assert len(rec.mails) == 1
+    em.deliver([Outgoing(6, "平仓", "info", t0 + 240, "R11", "111")], now=t0 + 240)
+    assert len(rec.mails) == 2
+    # 每小时上限仍然生效
+    res = em.deliver([Outgoing(7, "再开仓", "info", t0 + 300, "R00", "111")], now=t0 + 300)
+    assert len(rec.mails) == 2 and "每小时上限" in res[0][2]
