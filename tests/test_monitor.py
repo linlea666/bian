@@ -169,10 +169,12 @@ def test_hedge_transition_is_not_open_or_close():
     mon.leaders[0].initialized = True
     assert rules(mon.poll_once()) == ["R00"]  # 新开多单
     clock.t += 20
-    assert rules(mon.poll_once()) == []  # 变成对冲：不报新开仓/平仓
+    out = mon.poll_once()  # 变成对冲：合并仓位不算新开仓、多单不算平仓，只提醒真实开出的空单这条腿
+    assert [(a.rule_id, a.key) for a in out] == [("R00", "L:ETHUSDT:SHORT")]
     assert "L:ETHUSDT:HEDGE" in mon.states
     clock.t += 20
-    assert rules(mon.poll_once()) == []
+    out = mon.poll_once()  # 平掉空单：只提醒这条腿已平，多单照常持有
+    assert [(a.rule_id, a.key) for a in out] == [("R11", "L:ETHUSDT:SHORT")]
 
 
 def test_restart_after_downtime_with_new_entry_is_new_position(tmp_path):
@@ -191,3 +193,55 @@ def test_flush_records_delivery_result():
     mon.poll_once()
     rows = mon.store.db.execute("SELECT rule_id, delivered, error FROM alerts").fetchall()
     assert rows and all(r[1] == 1 and r[2] == "" for r in rows)
+
+
+def _leg(side, qty=1.0, sym="ETHUSDT"):
+    return Position("L", sym, side, qty, 100.0, 100.0, 10, 0.0, "public")
+
+
+def _titles(alerts):
+    return [(a.rule_id, a.key.split(":")[2], a.title) for a in alerts]
+
+
+def test_hedge_leg_open_close_alerts():
+    """同币种多空切换：开一边 / 平一边 / 反手都要有开平提醒（以前被当成结构变化整个吞掉）。"""
+    L, S = (lambda q=1.0: _leg("LONG", q)), (lambda q=1.0: _leg("SHORT", q))
+    mon, clock = make([[], [L()], [L(), S()], [L(), S()], [L(), S(2)], [L()], [S()], [S()]])
+    steps = [mon.poll_once() for _ in range(8) if not setattr(clock, "t", clock.t + 20)]
+    assert rules(steps[1]) == ["R00"]
+    assert _titles(steps[2]) == [("R00", "SHORT", "新开仓（与反方向仓位形成对冲）")]
+    assert steps[3] == []  # 下一轮不重复
+    assert rules(steps[4]) == ["R07"]  # 对冲中加仓照旧
+    assert _titles(steps[5]) == [("R11", "SHORT", "仓位已平（反方向仓位还在）")]
+    assert [(r, s) for r, s, _ in _titles(steps[6])] == [("R00", "SHORT"), ("R11", "LONG")]  # 反手
+    assert steps[6][0].title == "反手开仓（原反方向仓位已平）"
+    assert steps[7] == []
+
+
+def test_hedge_at_startup_only_summary():
+    mon, clock = make([[_leg("LONG"), _leg("SHORT")], [_leg("LONG"), _leg("SHORT")], [_leg("LONG")]])
+    assert rules(mon.poll_once()) == ["R00"]  # 启动汇总
+    clock.t += 20
+    assert mon.poll_once() == []
+    clock.t += 20
+    assert _titles(mon.poll_once()) == [("R11", "SHORT", "仓位已平（反方向仓位还在）")]
+
+
+def test_hedge_leg_actions_email_immediately_for_leader_switch():
+    from bian.notify import EmailNotifier, EVENT_KEYS, SmtpConfig
+    mails = []
+    em = EmailNotifier(SmtpConfig("h", 465, "u", "p", ["t"], "tls", "u"), events=[], batch_minutes=60,
+                       sender=lambda cfg, subj, body: mails.append(body), leader_actions={"L": True})
+    assert "R00" not in EVENT_KEYS
+    mon, clock = make([[_leg("LONG")], [_leg("LONG"), _leg("SHORT")], [_leg("LONG")]], notifier=em)
+    mon.poll_once()
+    mon.flush()
+    n0 = len(mails)  # 启动汇总（单独开启：立即发）
+    clock.t += 20
+    mon.poll_once()
+    mon.flush()
+    assert len(mails) == n0 + 1 and "新开仓（与反方向仓位形成对冲）" in mails[-1]
+    clock.t += 20
+    mon.poll_once()
+    mon.flush()
+    assert len(mails) == n0 + 2 and "仓位已平（反方向仓位还在）" in mails[-1]

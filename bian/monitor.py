@@ -442,6 +442,7 @@ class Monitor:
         self.auth_alerted = False
         self.store.add_snapshot(lr.cfg.portfolio_id, lr.source, [asdict(p) for p in positions])
 
+        prev_legs, was_init = dict(lr.positions), lr.initialized  # 上一轮的分腿持仓：对冲结构变化时按腿判断开 / 平
         lr.positions = {p.key: p for p in positions}
         if self.recorder:
             self.recorder.observe(lr.cfg.portfolio_id, lr.name, positions, now)
@@ -453,6 +454,7 @@ class Monitor:
         if not lr.initialized:
             self._drop_stale_states(current, now)
         residuals = (self.store.get_runtime("residuals", {})[0] or {}) if lr.source == "copy" else {}
+        restructured: set[str] = set()  # 多空结构变了的币种（单边 ↔ 对冲 / 反手）：开平提醒按腿补发
         for key, pos in current.items():
             known = key in self.states
             st, alerts = evaluate(pos, self.states.get(key), lr.rules, now, self._margin_u(lr, pos))
@@ -470,8 +472,9 @@ class Monitor:
                     f"平仓均价约 {res['leader_close_price']:.6g}",
                     "币安不会再替你平这个仓位，请在币安手动平仓（或确认你是有意继续持有）", now))
             if not known and pos.symbol in prev_symbols:
-                # 同币种从单边变成对冲（或反过来）：不当作新开仓
+                # 同币种从单边变成对冲（或反过来）：合并后的仓位不当作新开仓，真实的开 / 平按腿补发（见 _leg_actions）
                 alerts = [a for a in alerts if a.rule_id != "R00"]
+                restructured.add(pos.symbol)
             if not lr.initialized and not known:
                 # 启动时已存在的仓位：info 级提醒并入汇总，warn/urgent 仍单独发
                 line = f"{pos.symbol} {self._side_cn(pos)} {pos.leverage:g}x ROI {pos.roi * 100:+.1f}%"
@@ -495,11 +498,40 @@ class Monitor:
             st = self.states.pop(key)
             self.store.delete_state(key)
             if key.split(":")[1] in cur_symbols:
-                continue  # 只是多空结构变化，币种仍在持仓
+                restructured.add(key.split(":")[1])
+                continue  # 只是多空结构变化，币种仍在持仓（开 / 平的那条腿由 _leg_actions 提醒）
             out.append(self._send(Alert(
                 "R11", "info", key, st.version, "仓位已平（或已不在列表中）",
                 f"最后 ROI {st.last_roi * 100:+.1f}%，期间最高 {st.peak_roi * 100:+.1f}%、最低 {st.trough_roi * 100:+.1f}%",
                 ts=now), lr))
+        if was_init:
+            for sym in sorted(restructured):
+                out += self._leg_actions(lr, sym, prev_legs, lr.positions, now)
+        return out
+
+    def _leg_actions(self, lr: LeaderRuntime, symbol: str, prev: dict[str, Position], cur: dict[str, Position],
+                     now: float) -> list[Alert]:
+        """对冲结构变化时，按腿找出真实的开仓 / 平仓（例如持有多单时又开空、对冲中平掉一边、反手）。"""
+        def legs(d: dict[str, Position]) -> dict[str, Position]:
+            return {p.side: p for p in d.values() if p.symbol == symbol and p.side in ("LONG", "SHORT")}
+        before, after = legs(prev), legs(cur)
+        if not before:
+            return []  # 上一轮没有这个币种的分腿数据，无法判断，不误报
+        out = []
+        for side, p in after.items():
+            if side in before:
+                continue
+            other = "SHORT" if side == "LONG" else "LONG"
+            title = ("新开仓（与反方向仓位形成对冲）" if other in after
+                     else "反手开仓（原反方向仓位已平）" if other in before else "新开仓")
+            out.append(self._send(Alert("R00", "info", p.key, 0, title, ts=now), lr, p))
+        for side, p in before.items():
+            if side in after:
+                continue
+            other = "SHORT" if side == "LONG" else "LONG"
+            title = "仓位已平（反方向仓位还在）" if other in after else "仓位已平"
+            out.append(self._send(Alert(
+                "R11", "info", p.key, 0, title, f"最后 ROI {p.roi * 100:+.1f}%（上一轮数据）", ts=now), lr, p))
         return out
 
     def _check_stale(self, lr: LeaderRuntime, now: float) -> list[Alert]:
