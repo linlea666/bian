@@ -237,7 +237,7 @@ class EmailNotifier(Notifier):
     """事件过滤 + 合并发送 + 每小时上限 + 失败重试。
 
     events：发邮件的事件分组（None 表示按 min_severity 级别过滤，命令行旧配置用）。
-    batch_minutes：非紧急提醒攒多久汇总一封（0 = 每轮立即发）；有紧急提醒、或单独设为“发邮件”的领航员有交易动作时立即发，并捎上等待中的。"""
+    batch_minutes：非紧急提醒攒多久汇总一封（0 = 每轮立即发）；有紧急提醒时立即发，并捎上等待中的；单独设为“发邮件”的领航员 / 账户的交易动作立即单独一封。"""
 
     name = "email"
 
@@ -264,9 +264,9 @@ class EmailNotifier(Notifier):
             return event_group(it.rule_id) in self.events
         return LEVEL.get(it.severity, 0) >= self.min_level
 
-    def immediate(self, it: Outgoing) -> bool:
-        """不等汇总、立即发：紧急提醒；或单独设为“发邮件”的领航员 / 账户的交易动作（开仓 / 加仓 / 减仓 / 平仓）。"""
-        return it.severity == "urgent" or (it.rule_id in ACTION_RULES and self.leader_actions.get(it.leader_id) is True)
+    def solo(self, it: Outgoing) -> bool:
+        """单独设为“发邮件”的领航员 / 账户的交易动作（开仓 / 加仓 / 减仓 / 平仓）：立即发，每个动作单独一封。"""
+        return it.rule_id in ACTION_RULES and self.leader_actions.get(it.leader_id) is True
 
     def requeue(self, items: list[Outgoing]) -> None:
         """服务重启后，把还在等待合并的提醒放回队列（由调用方从 alerts 表恢复）。"""
@@ -295,30 +295,48 @@ class EmailNotifier(Notifier):
             self.pending = self.pending[drop:]
         if not self.pending:
             return results
+        solos = [p for p in self.pending if self.solo(p)]
+        rest = [p for p in self.pending if not self.solo(p)]
+        held: list[Outgoing] = []
+        for it in solos:  # 单独发的交易动作：一封一条，不顺带其他提醒
+            res = self._send_batch([it], now)
+            results += res
+            if not res[0][1]:
+                held.append(it)  # 超限 / 失败：留在队列，稍后照样单独补发
+        self.pending = held + rest
+        if not rest:
+            return results
+        new = [it for it in items if any(it is r for r in rest)]  # 本次新进来的普通提醒，回报状态用
         if now < self.retry_at:
-            return results + [(it, False, "email: 上次发送失败，等待重试") for it in items if it in self.pending]
-        now_ = any(self.immediate(p) for p in self.pending)  # 立即发时顺带捎上等待中的提醒
-        oldest = min(p.created for p in self.pending)
-        if not now_ and self.batch_s > 0 and now - oldest < self.batch_s:
+            return results + [(it, False, "email: 上次发送失败，等待重试") for it in new]
+        urgent = any(p.severity == "urgent" for p in rest)  # 紧急的立即发，并顺带捎上等待中的普通提醒
+        oldest = min(p.created for p in rest)
+        if not urgent and self.batch_s > 0 and now - oldest < self.batch_s:
             at = time.strftime("%H:%M", time.localtime(oldest + self.batch_s))
-            return results + [(it, False, f"email: {HELD}，约 {at} 汇总发送") for it in items if it in self.pending]
+            return results + [(it, False, f"email: {HELD}，约 {at} 汇总发送") for it in new]
+        res = self._send_batch(rest, now)
+        if res and res[0][1]:
+            self.pending = held
+        return results + res
+
+    def _send_batch(self, batch: list[Outgoing], now: float) -> list[Result]:
+        """发一封（含 batch 里的全部条目）；受每小时上限和失败重试约束。失败 / 超限时调用方负责把条目留在队列。"""
+        if now < self.retry_at:
+            return [(it, False, "email: 上次发送失败，等待重试") for it in batch]
         self.sent_times = [t for t in self.sent_times if now - t < 3600]
         if len(self.sent_times) >= self.max_per_hour:
-            return results + [(it, False, "email: 达到每小时上限，稍后合并补发") for it in items if it in self.pending]
-
-        batch, self.pending = self.pending, []
+            return [(it, False, "email: 达到每小时上限，稍后补发") for it in batch]
         subject, body = self.compose(batch, now)
         try:
             self._send_mail(self.cfg, subject, body)
         except Exception as e:  # noqa: BLE001
             err = "email: " + describe_smtp_error(e)
-            self.pending = batch + self.pending
             self.retry_at = now + self.retry_seconds
-            return results + [(it, False, err) for it in batch]
+            return [(it, False, err) for it in batch]
         self.sent_times.append(now)
         self.retry_at = 0.0
         self.dropped = 0
-        return results + [(it, True, "") for it in batch]
+        return [(it, True, "") for it in batch]
 
     def compose(self, batch: list[Outgoing], now: float) -> tuple[str, str]:
         urgent = sum(1 for b in batch if b.severity == "urgent")
@@ -327,6 +345,10 @@ class EmailNotifier(Notifier):
         parts = [f"{n} 条{label}" for n, label in ((urgent, "紧急"), (warn, "提醒"), (info, "信息")) if n]
         icon = ICON["urgent"] if urgent else ICON["warn"] if warn else ICON["info"]
         subject = f"{icon} 币安跟单风控：{' / '.join(parts)}"
+        if len(batch) == 1:  # 单条：标题直接写这条提醒（领航员、币种、动作），收件箱里一眼看清
+            first = batch[0].text.strip().splitlines()[0] if batch[0].text.strip() else ""
+            if first:
+                subject = f"{icon} {first[:80]}"
         order = sorted(batch, key=lambda b: (-LEVEL.get(b.severity, 0), b.created))
         lines = []
         late = [b for b in batch if now - b.created > 120]
