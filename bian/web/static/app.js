@@ -53,10 +53,23 @@ const tone = (v) => (v > 0 ? "up" : v < 0 ? "down" : "");
 const U = (x, d = 2) => (x == null ? "-" : `<span class="num ${tone(rnd(x, d))}">${signed(x, d)}U</span>`);
 const pct = (x, d = 1) => (x == null ? "-" : `<span class="num ${tone(rnd(x * 100, d))}">${signed(x * 100, d)}%</span>`);
 const side = (s) => ({ LONG: "多", SHORT: "空", HEDGE: "多空对冲" }[s] || s);
+/* 页面时间按服务器时区显示（和邮件里的“数据时间”、统计日期一致）；拿不到时退回浏览器时区 */
+function srvDate(ts) {
+  const off = S.me && typeof S.me.tz_offset === "number" ? S.me.tz_offset : null;
+  if (off == null) { const d = new Date(ts * 1000); return { y: d.getFullYear(), mo: d.getMonth() + 1, d: d.getDate(), h: d.getHours(), mi: d.getMinutes() }; }
+  const d = new Date((ts + off) * 1000);
+  return { y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes() };
+}
+function tzLabel() {
+  const off = S.me && S.me.tz_offset;
+  if (typeof off !== "number") return "浏览器所在时区";
+  const h = off / 3600;
+  return `${S.me.tz_name ? S.me.tz_name + "，" : ""}UTC${h >= 0 ? "+" : ""}${Number.isInteger(h) ? h : h.toFixed(1)}`;
+}
 function dt(ts) {
   if (!ts) return "-";
-  const d = new Date(ts * 1000), p = (n) => String(n).padStart(2, "0");
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const d = srvDate(ts), p = (n) => String(n).padStart(2, "0");
+  return `${p(d.mo)}-${p(d.d)} ${p(d.h)}:${p(d.mi)}`;
 }
 function ago(sec) {
   if (sec == null) return "从未";
@@ -406,6 +419,11 @@ const EV_LABEL = { position: "仓位", alert: "提醒", credential: "凭证", no
 const evLabel = (t) => EV_LABEL[String(t).split(".")[0]] || t;
 const EV_TYPES = [["", "全部类型"], ["position.", "仓位变化"], ["alert.", "提醒"], ["credential.", "凭证"], ["notify.", "邮件投递"],
   ["settings.", "设置修改"], ["data.", "数据中断/恢复"], ["leader.", "跟单增减"], ["account.", "交易所账户"], ["service.", "服务"], ["auth.", "登录"]];
+/* 提醒内容第一行 “[领航员 / 账户名] …” 里取出来源，显示在标题前 */
+function who(msg) {
+  const m = /^\[([^\]]{1,40})\]/.exec(msg || "");
+  return m ? `<span class="muted">${esc(m[1])} · </span>` : "";
+}
 async function pageRecords(tab) {
   const gen = S.gen;
   const ov = await api("GET", "/api/overview");
@@ -416,7 +434,7 @@ async function pageRecords(tab) {
     const { alerts } = await api("GET", "/api/alerts?limit=100");
     body = alerts.length ? `<div class="log">${alerts.map((a) => `<div class="ev">
         <div class="tm">${dt(a.ts)}<br><span class="badge ${a.severity === "urgent" ? "red" : a.severity === "warn" ? "yellow" : ""}">${{ urgent: "紧急", warn: "提醒", info: "信息" }[a.severity] || a.severity}</span></div>
-        <div><b>${esc(a.title)}</b>
+        <div>${who(a.message)}<b>${esc(a.title)}</b>
           ${deliveryLine(a)}
           <details><summary class="small muted">查看完整内容</summary><pre>${esc(a.message)}</pre></details></div></div>`).join("")}</div>`
       : `<div class="empty">还没有提醒</div>`;
@@ -495,7 +513,8 @@ async function pageSettings(tab) {
   if (tab === "rules") body = rulesForm(st);
   if (tab === "account") body = renderChangePassword(false) + maintForm(st) + `<div class="card"><h3>系统</h3>
       <p class="muted small">版本 v${esc(S.me.version)}。更新：在服务器执行 <code>cd /opt/bian && ./start.sh update</code>（几秒钟，数据和设置都会保留）。</p>
-      <p class="muted small">查看运行日志：<code>./start.sh logs</code>；自检：<code>./start.sh doctor</code>。</p></div>`;
+      <p class="muted small">查看运行日志：<code>./start.sh logs</code>；自检：<code>./start.sh doctor</code>。</p>
+      <p class="muted small">页面上的时间按服务器时区（${esc(tzLabel())}）显示，和邮件里的“数据时间”、统计的日期一致。</p></div>`;
   if (stale(gen)) return;
   root.innerHTML = shell("settings", "设置", statusChips(ov), `<div class="card"><div class="tabs">${tabs}</div>${body}</div>`);
   if (tab === "credentials") bindCredForm(() => pageSettings("credentials").then(bindShell));
@@ -970,8 +989,8 @@ function bars(items, valueKey, labelKey, h = 140) {
 /* ---------- 统计页 ---------- */
 async function pageStats(monthArg) {
   const gen = S.gen;
-  const now = new Date();
-  const month = /^\d{4}-\d{1,2}$/.test(monthArg || "") ? monthArg : `${now.getFullYear()}-${now.getMonth() + 1}`;
+  const now = srvDate(Date.now() / 1000);
+  const month = /^\d{4}-\d{1,2}$/.test(monthArg || "") ? monthArg : `${now.y}-${now.mo}`;
   const src = S.statSource || "all";
   const [ov, st] = await Promise.all([api("GET", "/api/overview"),
     api("GET", `/api/stats?month=${month}&source=${encodeURIComponent(src)}`).catch((e) => { S.statSource = "all"; throw e; })]);

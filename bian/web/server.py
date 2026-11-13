@@ -179,7 +179,9 @@ def make_handler(app):
     def me(h, q, b, s):
         cfg = app.settings.get()
         return {"username": s["username"], "csrf": s["csrf"], "must_change": auth.must_change(app.store, s["username"]),
-                "onboarding_done": cfg["onboarding_done"], "version": __version__}
+                "onboarding_done": cfg["onboarding_done"], "version": __version__,
+                # 页面时间统一按服务器时区显示（和邮件、统计的日期划分一致），不受浏览器所在时区影响
+                "tz_offset": time.localtime().tm_gmtoff, "tz_name": time.strftime("%Z")}
 
     def change_password(h, q, b, s):
         old, new = str(b.get("old") or ""), str(b.get("new") or "")
