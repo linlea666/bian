@@ -115,6 +115,10 @@ CREATE TABLE IF NOT EXISTS exchange_accounts (
   stop_check INTEGER DEFAULT 1, created REAL, last_ok REAL, last_error TEXT, perm TEXT,
   baseline_equity REAL, baseline_ts REAL, ledger_synced REAL, key_hint TEXT
 );
+-- 关注的币安聪明钱（公开实盘）：只提醒他的开 / 加 / 减 / 平仓动态
+CREATE TABLE IF NOT EXISTS smart_traders (
+  id TEXT PRIMARY KEY, name TEXT, added REAL, profile TEXT
+);
 -- 交易所账户的资金流水：已实现盈亏 / 手续费 / 资金费 / 划转（统计和“净投入”用）
 CREATE TABLE IF NOT EXISTS account_ledger (
   uid TEXT PRIMARY KEY, account_id TEXT, ts_ms INTEGER, kind TEXT, symbol TEXT, amount REAL

@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass, field
 
-from .api import copy_account, leaders as leaders_api
+from .api import copy_account, leaders as leaders_api, smart_money
 from .client import AuthExpired, BinanceError, Client, RateLimited
 from .config import AppConfig, LeaderConfig
 from .exposure import describe_legs, net_by_symbol
@@ -19,6 +19,8 @@ from .rules import (
 from .store import Store
 
 LEAD_URL = "https://www.binance.com/zh-CN/copy-trading/lead-details/{}"
+# 聪明钱（公开实盘）只提醒交易动态：开仓 / 加仓 / 减仓 / 平仓；“亏损中加仓”按普通加仓提醒，其余风险规则不发
+SMART_RULES = ("R00", "R07", "R07b", "R11")
 
 
 def _float(v) -> float | None:
@@ -49,6 +51,7 @@ class LeaderRuntime:
     stops: list = field(default_factory=list)
     stops_ts: float = 0.0
     last_error: str = ""
+    share_checked: float = 0.0  # 聪明钱：上次确认“是否公开持仓”的时间（持仓为空时才查，5 分钟一次）
 
 
 class Monitor:
@@ -61,11 +64,12 @@ class Monitor:
     STOPS_EVERY_S = 60  # 交易所账户的止损单每分钟查一次（不是每轮），节省请求
 
     def __init__(self, cfg: AppConfig, client: Client, notifier: Notifier, store: Store, clock=time.time,
-                 guard=None, recorder=None, rules_provider=None, exchange_provider=None):
+                 guard=None, recorder=None, rules_provider=None, exchange_provider=None, smart_provider=None):
         """guard：CredentialGuard（凭证失效时暂停私有接口）；recorder：EpisodeRecorder（仓位回合）；
         rules_provider(leader_id) -> RuleConfig：网页配置的阈值（支持按领航员覆盖，热更新）；
         exchange_provider() -> [(账户行, 适配器工厂)]：启用中的交易所账户（每轮同步，增删改即时生效）。"""
         self.exchange_provider = exchange_provider
+        self.smart_provider = smart_provider  # () -> [(主页 ID, 名字)]：关注的币安聪明钱
         self.copy_accounts_view: list[dict] = []
         self.exchange_view: dict[str, dict] = {}
         self.cfg, self.client, self.notifier, self.store, self.clock = cfg, client, notifier, store, clock
@@ -113,8 +117,8 @@ class Monitor:
                     c = LeaderConfig(portfolio_id=pid, name=str(rel.get("nickname") or ""), source="copy")
                     self.leaders.append(LeaderRuntime(c, self.rules_provider(pid)))
         for lr in self.leaders:
-            if lr.source == "exchange":
-                continue  # 交易所账户由 _sync_exchange_accounts 管理，和跟单关系无关（凭证恢复后重跑 setup 也不能改它的数据源）
+            if lr.source in ("exchange", "smart"):
+                continue  # 交易所账户 / 聪明钱由各自的同步函数管理；交易所账户由 _sync_exchange_accounts 管理，和跟单关系无关（凭证恢复后重跑 setup 也不能改它的数据源）
             pid = lr.cfg.portfolio_id
             try:
                 d = leaders_api.detail(self.client, pid)
@@ -146,6 +150,8 @@ class Monitor:
             return self._fetch_exchange(lr)
         if lr.source == "copy":
             return copy_account.copy_positions(self.client, lr.copy_portfolio_id or "", lr.cfg.portfolio_id)
+        if lr.source == "smart":
+            return smart_money.positions(self.client, lr.cfg.portfolio_id)
         return leaders_api.public_positions(self.client, lr.cfg.portfolio_id)
 
     def poll_once(self) -> list[Alert]:
@@ -154,11 +160,14 @@ class Monitor:
         t0 = time.monotonic()
         errors: list[str] = []
         self._sync_exchange_accounts(now)
+        self._sync_smart(now)
         for lr in self.leaders:
             if lr.blocked_reason:
                 continue
-            if lr.source == "copy" and self.private_paused:
+            if lr.source in ("copy", "smart") and self.private_paused:
                 continue  # 凭证失效：不拿失效凭证反复请求；由凭证守护负责提醒
+            if lr.source == "smart" and not self.client.has_credentials:
+                continue  # 聪明钱的持仓接口需要网页凭证；没配置时不请求（作战室会提示设置凭证）
             try:
                 positions = self.fetch(lr)
             except AuthExpired as e:
@@ -191,7 +200,7 @@ class Monitor:
                 d = asdict(p)
                 d.update(key=p.key, leader_name=lr.name, roi=p.roi, margin=p.margin,
                          liq_valid=p.liquidation_valid(),
-                         tier=max(st.loss.get("fired") or [-1]) + 1 if st else 0,
+                         tier=max(st.loss.get("fired") or [-1]) + 1 if st and p.source != "smart" else 0,
                          peak_roi=st.peak_roi if st else 0.0, trough_roi=st.trough_roi if st else 0.0,
                          first_seen=st.first_seen if st else now,
                          legs=[{**asdict(x), "roi": x.roi, "margin": x.margin} for x in legs
@@ -282,6 +291,32 @@ class Monitor:
                 lr.adapter = make()  # 首次或更新了密钥
                 lr.stops_ts = 0.0
             lr.account, lr.name = a, name
+
+    def _sync_smart(self, now: float) -> None:
+        """按关注列表同步聪明钱：新关注的加入，取消关注的退出（清掉他的仓位状态，以后重新关注从头开始）。"""
+        if not self.smart_provider:
+            return
+        try:
+            wanted = dict(self.smart_provider())
+        except Exception as e:  # noqa: BLE001  读关注列表失败不能影响其他监控
+            print(f"读取聪明钱关注列表失败：{type(e).__name__}: {e}")
+            return
+        for lr in [x for x in self.leaders if x.source == "smart"]:
+            pid = lr.cfg.portfolio_id
+            if pid not in wanted:
+                self.leaders.remove(lr)
+                for key in [k for k in self.states if k.startswith(pid + ":")]:
+                    self.states.pop(key)
+                    self.store.delete_state(key)
+        known = {lr.cfg.portfolio_id: lr for lr in self.leaders if lr.source == "smart"}
+        for pid, name in wanted.items():
+            lr = known.get(pid)
+            if lr is None:
+                lr = LeaderRuntime(LeaderConfig(portfolio_id=pid, name=name, source="smart"),
+                                   self.rules_provider(pid), source="smart", name=name)
+                self.leaders.append(lr)
+                self.store.log_event("smart.monitoring", f"[{name}] 开始跟踪这个聪明钱的开平仓", leader_id=pid, ts=now)
+            lr.name = name
 
     def _fetch_exchange(self, lr: LeaderRuntime) -> list[Position]:
         positions = lr.adapter.positions()
@@ -437,6 +472,23 @@ class Monitor:
                         return out
                 except BinanceError:
                     return out
+            if lr.source == "smart":
+                # 聪明钱可能关掉了“分享持仓”：这时空列表不代表平仓。不永久停用，等他重新公开后自动恢复
+                if now - lr.share_checked >= 300:
+                    try:
+                        sharing = smart_money.profile(self.client, lr.cfg.portfolio_id)["sharing_position"]
+                    except BinanceError:
+                        return out
+                    lr.share_checked = now
+                    if not sharing and lr.position_show is not False:
+                        out.append(self._send(Alert("R08", "warn", f"leader:{lr.cfg.portfolio_id}", 0,
+                                                    f"[{lr.name}] 关闭了持仓分享，暂时无法跟踪开平仓",
+                                                    "空列表不代表已平仓；他重新公开后会自动恢复", ts=now)))
+                    lr.position_show = sharing
+                if lr.position_show is False:
+                    return out
+        if positions and lr.source == "smart":
+            lr.position_show = True
         lr.empty_polls = 0
         lr.last_ok = now
         self.auth_alerted = False
@@ -444,7 +496,7 @@ class Monitor:
 
         prev_legs, was_init = dict(lr.positions), lr.initialized  # 上一轮的分腿持仓：对冲结构变化时按腿判断开 / 平
         lr.positions = {p.key: p for p in positions}
-        if self.recorder:
+        if self.recorder and lr.source != "smart":  # 聪明钱不是你的仓位：不记仓位回合
             self.recorder.observe(lr.cfg.portfolio_id, lr.name, positions, now)
         current = {p.key: p for p in net_by_symbol(positions)}  # 同币种多空合并后评估
         prefix = lr.cfg.portfolio_id + ":"
@@ -485,6 +537,8 @@ class Monitor:
                     line += f"（浮盈已达保本门槛，建议止损上移到约 {be:.6g}）"
                 summary.append(line)
                 alerts = [a for a in alerts if a.severity != "info"]
+            if lr.source == "smart":
+                alerts = self._smart_only(alerts)
             for a in alerts:
                 out.append(self._send(a, lr, pos))
         if not lr.initialized:
@@ -507,6 +561,19 @@ class Monitor:
         if was_init:
             for sym in sorted(restructured):
                 out += self._leg_actions(lr, sym, prev_legs, lr.positions, now)
+        return out
+
+    @staticmethod
+    def _smart_only(alerts: list[Alert]) -> list[Alert]:
+        """聪明钱只提醒交易动态；“亏损中加仓”改成普通加仓（标题保留），亏损档位 / 强平 / 浮盈回撤等风险提醒不发。"""
+        out = []
+        for a in alerts:
+            if a.rule_id == "R07L":
+                a = Alert("R07", "info", a.key, a.version, a.title, a.detail, "", a.ts)
+            elif a.rule_id == "R07":
+                a = Alert("R07", "info", a.key, a.version, "加仓", a.detail, "", a.ts)
+            if a.rule_id in SMART_RULES:
+                out.append(a)
         return out
 
     def _leg_actions(self, lr: LeaderRuntime, symbol: str, prev: dict[str, Position], cur: dict[str, Position],
@@ -609,6 +676,8 @@ class Monitor:
                 lines.append(f"{src}：开仓 {pos.entry_price:.6g} 现价 {pos.mark_price:.6g} ROI {pos.roi * 100:+.1f}%")
             if is_mine(pos.source):
                 lines.append(f"浮动盈亏 {pos.unrealized_pnl:+.2f}U")
+            elif pos.source == "smart":
+                lines.append(f"他的仓位：数量 {pos.qty:g}，保证金约 {pos.margin:.2f}U，浮动盈亏 {pos.unrealized_pnl:+.2f}U")
             elif lr.cfg.position_margin_u > 0:
                 lines.append(f"按每笔 {lr.cfg.position_margin_u:g}U 估算我的盈亏 {pos.roi * lr.cfg.position_margin_u:+.2f}U")
         elif lr:
@@ -621,7 +690,7 @@ class Monitor:
             lines.append("建议：" + a.suggestion)
         lines.append(f"规则 {a.rule_id} · 数据时间 {time.strftime('%m-%d %H:%M:%S', time.localtime(a.ts or self.clock()))}")
         if lr:
-            lines.append(LEAD_URL.format(lr.cfg.portfolio_id))
+            lines.append((smart_money.PROFILE_URL if lr.source == "smart" else LEAD_URL).format(lr.cfg.portfolio_id))
         if a.severity != "info":
             lines.append(FOOTER)
         return "\n".join(lines)

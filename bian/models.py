@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-SOURCE_LABELS = {"copy": "我的跟单仓位", "exchange": "交易所账户持仓", "public": "领航员仓位"}
+SOURCE_LABELS = {"copy": "我的跟单仓位", "exchange": "交易所账户持仓", "public": "领航员仓位", "smart": "聪明钱实盘"}
 
 
 def is_mine(source: str) -> bool:
@@ -33,7 +33,7 @@ class Position:
     mark_price: float
     leverage: float
     unrealized_pnl: float
-    source: str  # "public" 领航员公开持仓 / "copy" 我的跟单仓位 / "exchange" 交易所账户持仓
+    source: str  # "public" 领航员公开持仓 / "copy" 我的跟单仓位 / "exchange" 交易所账户持仓 / "smart" 关注的聪明钱实盘
     break_even_price: float = 0.0
     liquidation_price: float = 0.0
     initial_margin: float = 0.0  # 接口有就用，否则按开仓价反推

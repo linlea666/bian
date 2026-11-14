@@ -19,7 +19,7 @@ from .. import __version__
 from ..csvutil import to_csv
 from ..curl_parse import CurlParseError, parse_credentials
 from .. import exits as exits_mod, jobs as jobs_mod, leader_data, recommend as recommend_mod, stats as stats_mod
-from .. import accounts as accounts_mod
+from .. import accounts as accounts_mod, smart as smart_mod
 from ..api import leaders as leaders_api
 from ..exchanges import EXCHANGES
 from ..client import BinanceError, Client
@@ -223,7 +223,8 @@ def make_handler(app):
     def get_settings(h, q, b, s):
         poll, _ = app.store.get_runtime("poll", {})
         view = public_view(app.settings)
-        view["leaders"] = [{"id": lr["id"], "name": lr["name"]} for lr in (poll or {}).get("leaders", [])]
+        view["leaders"] = [{"id": lr["id"], "name": ("聪明钱 · " if lr.get("source") == "smart" else "") + lr["name"],
+                            "source": lr.get("source")} for lr in (poll or {}).get("leaders", [])]
         view["credentials"]["status"] = (app.store.get_runtime("credentials", {})[0] or {})
         return view
 
@@ -433,6 +434,42 @@ def make_handler(app):
                 "message": f"已删除，删除前的数据已备份到服务器 data/backups/{os.path.basename(path)}"}
 
     # ---------------------------------------------------------------- 交易所账户
+    # ---------------------------------------------------------- 聪明钱（公开实盘）
+    def _smart_call(fn):
+        try:
+            return fn()
+        except smart_mod.SmartError as e:
+            raise ApiError(400, str(e)) from None
+        except BinanceError as e:
+            raise ApiError(502, f"读取币安聪明钱主页失败：{e}") from None
+
+    def _public_client():
+        return discover_cache.setdefault("client", Client(min_interval=1.0))
+
+    def smart_list(h, q, b, s):
+        poll, _ = app.store.get_runtime("poll", {})
+        live = {x["id"]: x for x in (poll or {}).get("leaders", []) if x.get("source") == "smart"}
+        la = app.settings.get()["notify"]["leader_actions"]
+        rows = [{**t, "email": la.get(t["id"]), "positions": (live.get(t["id"]) or {}).get("positions"),
+                 "last_ok": (live.get(t["id"]) or {}).get("last_ok")} for t in smart_mod.list_traders(app.store)]
+        return {"traders": rows, "max": smart_mod.MAX_FOLLOW, "credentials_ok": app.client.has_credentials}
+
+    def smart_lookup(h, q, b, s):
+        prof = _smart_call(lambda: smart_mod.lookup(_public_client(), q.get("q") or ""))
+        prof["followed"] = any(t["id"] == prof["id"] for t in smart_mod.list_traders(app.store))
+        return prof
+
+    def smart_follow(h, q, b, s):
+        out = _smart_call(lambda: smart_mod.follow(app.store, app.settings, _public_client(), str(b.get("q") or ""),
+                                                   email=b.get("email") is not False))
+        app.wake()
+        return out
+
+    def smart_unfollow(h, q, b, s):
+        out = _smart_call(lambda: smart_mod.unfollow(app.store, app.settings, str(b.get("id") or "")))
+        app.wake()
+        return out
+
     def accounts_list(h, q, b, s):
         live = app.store.get_runtime("accounts", [])[0] or []
         return {"accounts": accounts_mod.list_accounts(app.store), "exchanges": EXCHANGES,
@@ -587,6 +624,10 @@ def make_handler(app):
         ("GET", "/api/leaders/export"): (leader_export, True),
         ("POST", "/api/leaders/adopt"): (leader_adopt, True),
         ("GET", "/api/discover"): (discover, True),
+        ("GET", "/api/smart"): (smart_list, True),
+        ("GET", "/api/smart/lookup"): (smart_lookup, True),
+        ("POST", "/api/smart/follow"): (smart_follow, True),
+        ("POST", "/api/smart/unfollow"): (smart_unfollow, True),
         ("GET", "/api/accounts"): (accounts_list, True),
         ("POST", "/api/accounts/test"): (account_test, True),
         ("POST", "/api/accounts"): (account_add, True),

@@ -367,7 +367,7 @@ async function pagePositions() {
   const [ov, pv] = await Promise.all([api("GET", "/api/overview"), api("GET", "/api/positions")]);
   const sorted = pv.positions.slice().sort((a, b) => (b.tier || 0) - (a.tier || 0) || (a.unrealized_pnl - b.unrealized_pnl));
   const mineList = sorted.filter((p) => p.source === "copy"), exList = sorted.filter((p) => p.source === "exchange");
-  const publicList = sorted.filter((p) => p.source === "public");
+  const publicList = sorted.filter((p) => p.source === "public"), smartList = sorted.filter((p) => p.source === "smart");
   // 止损单（交易所账户）：没挂 / 触发价 + 覆盖比例 + 触发时大约盈亏
   const stopCell = (p) => {
     if (p.stop_price == null || p.side === "HEDGE") return '<span class="muted">-</span>';
@@ -411,6 +411,14 @@ async function pagePositions() {
     ${table(mineList, ov.credentials.state === "valid" ? "当前没有持仓" : "设置币安凭证后显示你的跟单仓位")}
     <p class="hint">同一个币同时有多单和空单时合并为一行“多空对冲”，下面列出两条腿。亏损档位按合并后的净亏损计算。</p></div>
     ${exList.length ? `<div class="card"><div class="card-h"><h2>交易所账户持仓（${exList.length}）</h2><span class="muted small">你自己在币安 / OKX 交易的仓位</span></div>${table(exList, "", true)}</div>` : ""}
+    ${smartList.length ? `<div class="card"><div class="card-h"><h2>关注的聪明钱持仓（${smartList.length}）</h2><span class="muted small">他本人的实盘仓位，不是你的钱；只提醒开平仓动态</span></div>
+      <div class="tbl-wrap"><table class="cards"><thead><tr><th>聪明钱</th><th>币种 / 方向</th><th class="r">开仓价</th><th class="r">保证金</th><th class="r">他的浮动盈亏</th><th class="r">ROI</th><th class="r">持仓时长</th><th></th></tr></thead><tbody>
+      ${smartList.map((p) => `<tr><td data-l="聪明钱">${esc(p.leader_name)}</td>
+        <td data-l="币种"><b>${esc(p.symbol)}</b> ${side(p.side)} <span class="muted">${num(p.leverage, 0)}x</span></td>
+        <td data-l="开仓价" class="r num">${p.side === "HEDGE" ? "-" : num(p.entry_price, 4)}</td><td data-l="保证金" class="r num">${num(p.margin)}U</td>
+        <td data-l="他的浮动盈亏" class="r">${U(p.unrealized_pnl)}</td><td data-l="ROI" class="r">${pct(p.roi)}</td>
+        <td data-l="持仓时长" class="r">${p.first_seen ? ago(Date.now() / 1000 - p.first_seen) : "-"}</td>
+        <td data-l=""><a class="btn sm ghost" href="${esc(p.link)}" target="_blank" rel="noopener">主页 ↗</a></td></tr>`).join("")}</tbody></table></div></div>` : ""}
     ${publicList.length ? `<div class="card"><div class="card-h"><h2>观察中的领航员公开持仓（${publicList.length}）</h2><span class="muted small">领航员本人的仓位，不是你的钱</span></div>${table(publicList)}</div>` : ""}`);
 }
 
@@ -873,7 +881,7 @@ function rulesForm(st) {
       `<tr><td>${esc(names[id] || id)}</td><td class="small">${Object.entries(o).map(([k, v]) => `${esc(OV_NAMES[k] || k)} = ${esc(fmtOv(k, v))}`).join("；")}</td>
        <td><button class="btn sm" data-unset="${esc(id)}">恢复全局</button></td></tr>`).join("")}</tbody></table></div>` : ""}
     <form id="ovForm" class="card" style="margin-top:10px">
-      <label class="f"><span>选择领航员</span><select name="leader">${(st.leaders || []).map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("") || '<option value="">（设置凭证后显示你的跟单）</option>'}</select></label>
+      <label class="f"><span>选择领航员</span><select name="leader">${(st.leaders || []).filter((l) => l.source !== "smart").map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join("") || '<option value="">（设置凭证后显示你的跟单）</option>'}</select></label>
       <div class="row">${RULE_GROUPS.flatMap(([, items]) => items).filter((it) => OVERRIDE_KEYS.includes(it[0])).map((it) => ruleInput(r, it, "o_")).join("")}</div>
       <div class="actions"><button class="btn">保存该领航员的设置</button></div><div id="ovMsg"></div>
     </form>`;
@@ -1126,14 +1134,16 @@ const DISC = { range: "30D", sort: "ROI", minRoi: "", maxMdd: "50", copierWin: t
 async function pageDiscover() {
   const gen = S.gen;
   const f = S.disc || (S.disc = { ...DISC });
-  const [ov, d] = await Promise.all([api("GET", "/api/overview"),
-    api("GET", `/api/discover?range=${f.range}&sort=${f.sort}`).catch((e) => ({ error: e.message, items: [] }))]);
+  const [ov, d, sm] = await Promise.all([api("GET", "/api/overview"),
+    api("GET", `/api/discover?range=${f.range}&sort=${f.sort}`).catch((e) => ({ error: e.message, items: [] })),
+    api("GET", "/api/smart").catch(() => ({ traders: [], max: 10, credentials_ok: true }))]);
   if (stale(gen)) return;
   const list = d.items.filter((x) => (f.minRoi === "" || x.roi >= Number(f.minRoi)) && (f.maxMdd === "" || x.mdd <= Number(f.maxMdd))
     && (!f.copierWin || x.copier_pnl > 0) && (!f.hideFull || !x.max_copiers || x.copiers < x.max_copiers)
     && (f.minAum === "" || x.aum >= Number(f.minAum)));
   const sel = (name, opts, v) => `<select name="${name}">${opts.map(([k, t]) => `<option value="${k}" ${k === v ? "selected" : ""}>${t}</option>`).join("")}</select>`;
   root.innerHTML = shell("leaders", "领航员", statusChips(ov), `${leaderTabs("discover")}
+    ${smartCard(sm)}
     <form class="card" id="discForm"><div class="card-h"><h2>发现领航员</h2><span class="muted small">数据来自币安跟单榜单（前 90 名），10 分钟更新一次</span></div>
       <div class="row">
         <label class="f"><span>时间范围</span>${sel("range", [["7D", "7 天"], ["30D", "30 天"], ["90D", "90 天"], ["180D", "180 天"]], f.range)}</label>
@@ -1157,6 +1167,7 @@ async function pageDiscover() {
           <a class="btn sm ghost" href="https://www.binance.com/zh-CN/copy-trading/lead-details/${esc(x.id)}" target="_blank" rel="noopener">币安 ↗</a></td></tr>`).join("")}</tbody></table></div>`
       : `<div class="empty">没有符合条件的领航员，放宽一下筛选条件试试</div>`}</div>`);
   bindLeaderTabs();
+  bindSmartCard();
   document.getElementById("discForm").onsubmit = (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1167,6 +1178,66 @@ async function pageDiscover() {
   root.querySelectorAll("[data-watch]").forEach((b) => (b.onclick = async () => {
     try { const r = await api("POST", "/api/leaders/analyze", { id: b.dataset.watch, name: b.dataset.name }); toast(r.message); pageLeaders().then(bindShell); }
     catch (err) { toast(err.message); }
+  }));
+}
+
+/* ---------- 关注币安聪明钱（公开实盘）：只提醒他的开 / 加 / 减 / 平仓 ---------- */
+function smartCard(sm) {
+  const look = S.smartLook;
+  const lookBox = !look ? "" : look.error ? `<div class="msg err">${esc(look.error)}</div>` : `<div class="smart-look">
+      <div><b>${esc(look.name)}</b> <span class="muted small">ID ${esc(look.id)} · 带单 ${look.days} 天 · 订阅 ${look.subscribers}</span>
+        ${look.sharing_position ? '<span class="badge green">公开持仓</span>' : '<span class="badge red">未公开持仓</span>'}</div>
+      <div class="small">收益率 ${pct(look.roi, 1)} · 累计盈亏 ${U(look.pnl, 0)} · 最大回撤 <span class="num">${num(look.mdd * 100, 1)}%</span> · 胜率 <span class="num">${num(look.win_rate * 100, 0)}%</span> · 合约余额 <span class="num">${num(look.balance, 0)}U</span></div>
+      ${look.intro ? `<div class="small muted">${esc(look.intro)}</div>` : ""}
+      <div class="actions">${look.followed ? '<span class="badge">已关注</span>' : look.sharing_position
+        ? `<label class="chk"><input type="checkbox" id="smartEmail" checked> 开平仓发邮件（每个动作立即单独一封）</label><button class="btn primary sm" type="button" id="smartFollow">关注</button>`
+        : '<span class="muted small">他没有公开当前持仓，无法跟踪开平仓</span>'}
+        <a class="btn sm ghost" href="${esc(look.url)}" target="_blank" rel="noopener">主页 ↗</a></div></div>`;
+  const rows = sm.traders.map((t) => `<tr><td data-l="聪明钱"><b>${esc(t.name)}</b><div class="small muted">${esc(t.id)}</div></td>
+      <td data-l="当前持仓" class="r num">${t.positions == null ? "-" : t.positions}</td>
+      <td data-l="开平仓邮件">${t.email === true ? '<span class="badge green">发邮件</span>' : t.email === false ? '<span class="badge">不发</span>' : '<span class="badge">跟随全局</span>'}</td>
+      <td data-l="关注时间">${dt(t.added)}</td>
+      <td data-l=""><a class="btn sm ghost" href="${esc(t.url)}" target="_blank" rel="noopener">主页 ↗</a>
+        <button class="btn sm" data-unfollow="${esc(t.id)}" data-name="${esc(t.name)}">取消关注</button></td></tr>`).join("");
+  return `<div class="card" id="smartCard"><div class="card-h"><h2>关注币安聪明钱（公开实盘）</h2><span class="muted small">已关注 ${sm.traders.length}/${sm.max}</span></div>
+    <form class="row" id="smartForm"><label class="f grow"><span>主页链接或 ID</span>
+      <input name="q" placeholder="https://www.binance.com/zh-CN/smart-money/profile/4555302160171872539" value="${esc(S.smartQ || "")}"></label>
+      <div class="actions"><button class="btn">查询</button></div></form>
+    ${lookBox}
+    ${sm.credentials_ok ? "" : '<div class="msg err">读取他的持仓需要币安网页凭证：先在 设置 → 币安凭证 里配置</div>'}
+    ${rows ? `<div class="tbl-wrap"><table class="cards"><thead><tr><th>聪明钱</th><th class="r">当前持仓</th><th>开平仓邮件</th><th>关注时间</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : ""}
+    <p class="hint">只提醒他的开仓 / 加仓 / 减仓 / 平仓 / 反手（每轮对比他的持仓得出，约 20 秒内）；他的仓位不是你的钱，不做亏损档位、强平等风险提醒，也不计入你的权益和统计。
+      邮件开关在 设置 → 邮件提醒 → 按领航员单独设置 里可以随时改。</p></div>`;
+}
+function bindSmartCard() {
+  const f = document.getElementById("smartForm");
+  if (!f) return;
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    S.smartQ = new FormData(f).get("q").trim();
+    try { S.smartLook = await api("GET", "/api/smart/lookup?q=" + encodeURIComponent(S.smartQ)); }
+    catch (err) { S.smartLook = { error: err.message }; }
+    pageLeaders().then(bindShell);
+  };
+  const fb = document.getElementById("smartFollow");
+  if (fb) fb.onclick = async () => {
+    try {
+      const r = await api("POST", "/api/smart/follow", { q: S.smartLook.id, email: document.getElementById("smartEmail").checked });
+      toast(`已关注 ${r.name}` + (r.email ? "，开平仓会立即发邮件" : ""));
+      S.smartLook = { ...S.smartLook, followed: true };
+      S.settings = await api("GET", "/api/settings");  // 邮件设置里的单独开关已变
+    } catch (err) { toast(err.message); }
+    pageLeaders().then(bindShell);
+  };
+  root.querySelectorAll("[data-unfollow]").forEach((b) => (b.onclick = async () => {
+    if (!confirm(`取消关注 ${b.dataset.name}？之后不再提醒他的开平仓。`)) return;
+    try {
+      await api("POST", "/api/smart/unfollow", { id: b.dataset.unfollow });
+      if (S.smartLook && S.smartLook.id === b.dataset.unfollow) S.smartLook = { ...S.smartLook, followed: false };
+      S.settings = await api("GET", "/api/settings");
+      toast("已取消关注");
+    } catch (err) { toast(err.message); }
+    pageLeaders().then(bindShell);
   }));
 }
 

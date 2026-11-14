@@ -10,7 +10,7 @@ from .config import AppConfig
 from .credentials import CredentialGuard
 from .lifecycle import EpisodeRecorder
 from .monitor import Monitor
-from . import accounts
+from . import accounts, smart
 from .notify import HELD, EmailNotifier, MultiNotifier, Outgoing, StdoutNotifier, describe_smtp_error, smtp_send
 from .rules import Alert
 from .settings import Settings
@@ -130,7 +130,8 @@ class App:
                                recorder=EpisodeRecorder(store, self.clock),
                                rules_provider=lambda pid: self.settings.rules_config(pid),
                                exchange_provider=lambda: [(a, lambda a=a: accounts.adapter(self.settings, a))
-                                                          for a in accounts.active(store)])
+                                                          for a in accounts.active(store)],
+                               smart_provider=lambda: [(t["id"], t["name"]) for t in smart.list_traders(store)])
         store.log_event("service.start", "风控服务已启动")
         if self.restore_held(store):
             print("已恢复重启前等待发送的邮件提醒", flush=True)

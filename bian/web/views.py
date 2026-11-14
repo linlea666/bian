@@ -12,8 +12,13 @@ EXCHANGE_URLS = {"binance": "https://www.binance.com/zh-CN/my/orders/futures/ope
                  "okx": "https://www.okx.com/zh-hans/trade-swap"}
 
 
-def target_link(leader_id: str, exchange: str | None = None) -> str:
-    """跟单 → 领航员主页；交易所账户（x 开头）→ 交易所的合约页面。"""
+SMART_URL = "https://www.binance.com/zh-CN/smart-money/profile/{}"
+
+
+def target_link(leader_id: str, exchange: str | None = None, source: str = "") -> str:
+    """跟单 → 领航员主页；交易所账户（x 开头）→ 交易所的合约页面；聪明钱 → 他的主页。"""
+    if source == "smart":
+        return SMART_URL.format(leader_id)
     if leader_id.startswith("x"):
         return EXCHANGE_URLS.get(exchange or "", EXCHANGE_URLS["binance"])
     return LEAD_URL.format(leader_id)
@@ -88,7 +93,7 @@ def build_todos(ctx: dict) -> list[dict]:
         add("email:missing", "yellow", "设置邮件提醒", "没有邮箱时，提醒只能在后台看到，手机上收不到。",
             "去设置", "#/settings/email")
     for p in ctx["positions"]:
-        if p.get("tier", 0) >= 1:
+        if p.get("tier", 0) >= 1 and p.get("source") != "smart":  # 关注的聪明钱不是你的仓位：不出风险待办
             side = {"LONG": "多", "SHORT": "空", "HEDGE": "多空对冲"}.get(p["side"], p["side"])
             u = f"{p['unrealized_pnl']:+.2f}U" if is_mine(p.get("source") or "") else ""
             ex = p.get("source") == "exchange"
@@ -155,7 +160,7 @@ def overview(store, settings, now: float | None = None) -> dict:
     positions = positions or []
     exmap = dict(store.db.execute("SELECT id, exchange FROM exchange_accounts").fetchall())
     for p in positions:
-        p["link"] = target_link(p["leader_id"], exmap.get(p["leader_id"]))
+        p["link"] = target_link(p["leader_id"], exmap.get(p["leader_id"]), p.get("source") or "")
     smtp_ok = settings.smtp_config(cfg) is not None and cfg["notify"]["email_enabled"]
     # 只把真正的发送错误算作失败：按设置不发、等待合并、达到每小时上限稍后补发等，都不是故障
     last_mail_fail = store.db.execute(
@@ -186,7 +191,7 @@ def overview(store, settings, now: float | None = None) -> dict:
             "exchange_equity": sum(a["equity"] for a in accounts if a.get("kind") == "exchange"),
             "unrealized": sum(p["unrealized_pnl"] for p in positions if is_mine(p.get("source") or "")),
             "today_pnl": today, "month_pnl": month,
-            "positions": len(positions),
+            "positions": sum(1 for p in positions if p.get("source") != "smart"),
             "worst_position": worst and {k: worst[k] for k in ("leader_name", "symbol", "side", "unrealized_pnl", "roi")},
             "alerts_today": alerts_today,
         },
@@ -205,7 +210,7 @@ def positions_view(store) -> dict:
         keys = [p["key"]] if p["side"] != "HEDGE" else [f"{p['leader_id']}:{p['symbol']}:LONG", f"{p['leader_id']}:{p['symbol']}:SHORT"]
         eps = [open_eps[k] for k in keys if k in open_eps]
         p["episodes"] = [{k: e[k] for k in ("id", "opened_ts", "mae_roi", "mae_u", "mfe_roi", "mfe_u", "adds", "reduces", "max_tier")} for e in eps]
-        p["link"] = target_link(p["leader_id"], exchanges.get(p["leader_id"]))
+        p["link"] = target_link(p["leader_id"], exchanges.get(p["leader_id"]), p.get("source") or "")
     return {"updated": upd, "positions": positions or []}
 
 
